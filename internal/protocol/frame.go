@@ -22,6 +22,9 @@ const (
 	RELEASE   uint8 = 10
 	PING      uint8 = 11
 	PONG      uint8 = 12
+	// CLOSE announces that the sender is gracefully closing an idle
+	// connection. It carries no payload and lease ID 0.
+	CLOSE uint8 = 13
 )
 
 type Frame struct {
@@ -50,7 +53,7 @@ func valid(typ uint8, n int) error {
 		if n != 8 {
 			return errors.New("invalid nonce length")
 		}
-	case HELLO_OK, READY, OPEN, OPEN_OK, FIN, RELEASE:
+	case HELLO_OK, READY, OPEN, OPEN_OK, FIN, RELEASE, CLOSE:
 		if n != 0 {
 			return errors.New("unexpected payload")
 		}
@@ -104,10 +107,20 @@ func writeFull(w io.Writer, b []byte) error {
 }
 
 type Hello struct {
-	Version     int    `json:"version"`
-	Service     string `json:"service"`
-	Token       string `json:"token"`
-	Compression string `json:"compression"`
+	Version     int        `json:"version"`
+	Service     string     `json:"service"`
+	Token       string     `json:"token"`
+	Compression string     `json:"compression"`
+	Pool        PoolParams `json:"pool"`
+}
+
+// PoolParams are the client's per-connection pool timings, in milliseconds.
+type PoolParams struct {
+	HeartbeatMS      int64 `json:"heartbeat_ms"`
+	IdleTimeoutMS    int64 `json:"idle_timeout_ms"`
+	IdleJitterMS     int64 `json:"idle_jitter_ms"`
+	MaxLifetimeMS    int64 `json:"max_lifetime_ms"`
+	LifetimeJitterMS int64 `json:"lifetime_jitter_ms"`
 }
 type Code struct {
 	Code string `json:"code"`

@@ -15,13 +15,13 @@ func (t tinyReader) Read(p []byte) (int, error) { return t.Reader.Read(p[:min(le
 func TestFrames(t *testing.T) {
 	var b bytes.Buffer
 	out := NewConn(&rw{Reader: &b, Writer: &b})
-	for _, f := range []Frame{{Type: READY}, {Type: DATA, LeaseID: 1, Payload: []byte("hello")}, {Type: FIN, LeaseID: 1}} {
+	for _, f := range []Frame{{Type: READY}, {Type: DATA, LeaseID: 1, Payload: []byte("hello")}, {Type: FIN, LeaseID: 1}, {Type: CLOSE}} {
 		if e := out.WriteFrame(f); e != nil {
 			t.Fatal(e)
 		}
 	}
 	in := NewConn(&rw{Reader: tinyReader{&b}, Writer: io.Discard})
-	for _, typ := range []uint8{READY, DATA, FIN} {
+	for _, typ := range []uint8{READY, DATA, FIN, CLOSE} {
 		f, e := in.ReadFrame()
 		if e != nil || f.Type != typ {
 			t.Fatalf("frame %d: %v", typ, e)
@@ -30,7 +30,7 @@ func TestFrames(t *testing.T) {
 	for _, tc := range []struct {
 		typ uint8
 		n   uint32
-	}{{DATA, 0}, {DATA, 32769}, {HELLO, 4097}, {READY, 1}, {99, 0}} {
+	}{{DATA, 0}, {DATA, 32769}, {HELLO, 4097}, {READY, 1}, {CLOSE, 1}, {99, 0}} {
 		var h [13]byte
 		h[0] = tc.typ
 		binary.BigEndian.PutUint32(h[9:], tc.n)
