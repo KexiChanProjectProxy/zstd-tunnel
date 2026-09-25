@@ -219,3 +219,59 @@ func TestStopNeverReturnsCheckingOrReleasingToIdle(t *testing.T) {
 		t.Fatal("late READY restored stopped worker")
 	}
 }
+
+func TestStats(t *testing.T) {
+	p := New(4)
+	if s := p.Stats(); s != (Stats{}) {
+		t.Fatalf("empty pool %+v", s)
+	}
+	w, _ := p.Register(1, Options{}, func() {})
+	if s := p.Stats(); s.Registering != 1 {
+		t.Fatalf("registering %+v", s)
+	}
+	w.Idle()
+	if s := p.Stats(); s.Idle != 1 || s.Registering != 0 {
+		t.Fatalf("idle %+v", s)
+	}
+	a, b := pair(t)
+	defer a.Close()
+	defer b.Close()
+	_ = p.Dispatch(context.Background(), b, time.Now().Add(time.Second))
+	if s := p.Stats(); s.Leased != 1 || s.Idle != 0 {
+		t.Fatalf("leased %+v", s)
+	}
+	// With the only worker leased, visitors queue.
+	c, d := pair(t)
+	defer c.Close()
+	defer d.Close()
+	_ = p.Dispatch(context.Background(), d, time.Now().Add(20*time.Millisecond))
+	e, f := pair(t)
+	defer e.Close()
+	defer f.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = p.Dispatch(ctx, f, time.Now().Add(time.Minute))
+	if s := p.Stats(); s.Pending != 2 {
+		t.Fatalf("pending %+v", s)
+	}
+	cancel()
+	time.Sleep(60 * time.Millisecond)
+	if s := p.Stats(); s.Pending != 0 || s.WaitTimeouts != 1 || s.WaitCanceled != 1 {
+		t.Fatalf("dropped visitors %+v", s)
+	}
+	w.Releasing()
+	if s := p.Stats(); s.Releasing != 1 {
+		t.Fatalf("releasing %+v", s)
+	}
+	g, h := pair(t)
+	defer g.Close()
+	defer h.Close()
+	_ = p.Dispatch(context.Background(), h, time.Now().Add(time.Minute))
+	p.Stop()
+	if s := p.Stats(); s.Pending != 0 || s.WaitCanceled != 2 || s.WaitTimeouts != 1 {
+		t.Fatalf("after stop %+v", s)
+	}
+	w.Closed()
+	if s := p.Stats(); s.Releasing != 0 {
+		t.Fatalf("closed worker still counted %+v", s)
+	}
+}

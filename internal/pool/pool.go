@@ -78,6 +78,52 @@ type Pool struct {
 	idle       list.List // ordered by ascending Worker.ID; Back is the newest
 	waiting    list.List
 	pending    int
+	// Queued visitors dropped without being served, by cause.
+	waitTimeouts, waitCanceled uint64
+}
+
+// Stats is a point-in-time view of a pool for monitoring.
+type Stats struct {
+	// Workers by state. Closed workers are removed and not counted.
+	Registering, Idle, Leased, Releasing, Checking, Expiring int
+	// Pending is the number of visitors queued for a connection.
+	Pending int
+	// WaitTimeouts and WaitCanceled count, since the pool was created,
+	// queued visitors closed because their acquire deadline passed or their
+	// context was cancelled (including by Stop).
+	WaitTimeouts, WaitCanceled uint64
+}
+
+func (p *Pool) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := Stats{Pending: p.pending, WaitTimeouts: p.waitTimeouts, WaitCanceled: p.waitCanceled}
+	for w := range p.workers {
+		switch w.state {
+		case registering:
+			s.Registering++
+		case idle:
+			s.Idle++
+		case leased:
+			s.Leased++
+		case releasing:
+			s.Releasing++
+		case checking:
+			s.Checking++
+		case expiring:
+			s.Expiring++
+		}
+	}
+	return s
+}
+
+// dropLocked records why a queued visitor is being closed unserved.
+func (p *Pool) dropLocked(v *waiter) {
+	if v.ctx.Err() != nil {
+		p.waitCanceled++
+	} else {
+		p.waitTimeouts++
+	}
 }
 
 func New(maxPending int) *Pool {
@@ -174,6 +220,7 @@ func (p *Pool) matchLocked(w *Worker) []*net.TCPConn {
 		next := e.Next()
 		v := e.Value.(*waiter)
 		if v.ctx.Err() != nil || !time.Now().Before(v.deadline) {
+			p.dropLocked(v)
 			p.removeLocked(v)
 			expired = append(expired, v.tcp)
 			e = next
@@ -282,6 +329,7 @@ func (p *Pool) Dispatch(ctx context.Context, tcp *net.TCPConn, deadline time.Tim
 			p.mu.Unlock()
 			return
 		}
+		p.dropLocked(v)
 		p.removeLocked(v)
 		p.mu.Unlock()
 		_ = tcp.Close()
@@ -379,6 +427,7 @@ func (p *Pool) Stop() {
 	for e := p.waiting.Front(); e != nil; {
 		next := e.Next()
 		v := e.Value.(*waiter)
+		p.waitCanceled++
 		p.removeLocked(v)
 		tcp = append(tcp, v.tcp)
 		e = next
