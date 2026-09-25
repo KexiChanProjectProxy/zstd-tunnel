@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/config"
+	"github.com/kexichanprojectproxy/zstd-tunnel/internal/metrics"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/protocol"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/relay"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/transport"
@@ -45,6 +46,7 @@ type service struct {
 	idle, connecting int
 	backoff          time.Duration
 	notBefore        time.Time
+	stats            *metrics.Service
 }
 type slot struct {
 	conn  *protocol.Conn
@@ -55,10 +57,33 @@ type slot struct {
 type runtime struct {
 	cfg      *config.Client
 	log      *slog.Logger
+	metrics  *metrics.Exporter
+	services map[string]*service
 	mu       sync.Mutex
 	slots    map[*slot]struct{}
 	stopping bool
 	wg       sync.WaitGroup
+}
+
+// snapshot reports each service's tunnel connections by state for the
+// metrics endpoint. Connecting and idle come from the service counters,
+// which the controller updates before a slot exists; busy slots are counted
+// directly.
+func (r *runtime) snapshot() map[string]metrics.Slots {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]metrics.Slots, len(r.services))
+	for name, svc := range r.services {
+		out[name] = metrics.Slots{Connecting: svc.connecting, Idle: svc.idle}
+	}
+	for s := range r.slots {
+		if s.state == busySlot {
+			v := out[s.svc.name]
+			v.Busy++
+			out[s.svc.name] = v
+		}
+	}
+	return out
 }
 
 func (svc *service) notify() {
@@ -124,6 +149,13 @@ func (r *runtime) runConn(ctx context.Context, svc *service) {
 	}
 	failed := e != nil && ctx.Err() == nil && !r.stopping
 	if failed {
+		// A slot still connecting never registered; otherwise a registered
+		// connection failed.
+		if s.state == connecting {
+			svc.stats.DialFailures.Add(1)
+		} else {
+			svc.stats.Retired("error")
+		}
 		if time.Since(started) >= stableAfter {
 			svc.backoff = baseBackoff
 		}
@@ -191,8 +223,10 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) erro
 	if f.Type == protocol.HELLO_ERR {
 		var code protocol.Code
 		if protocol.DecodeJSON(f.Payload, &code) == nil {
+			svc.stats.Rejected(code.Code)
 			return errors.New("registration: " + code.Code)
 		}
+		svc.stats.Rejected("other")
 		return errors.New("invalid HELLO_ERR")
 	}
 	if f.Type != protocol.HELLO_OK {
@@ -203,11 +237,12 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) erro
 	svc.connecting--
 	svc.idle++
 	r.mu.Unlock()
+	svc.stats.Opened.Add(1)
 	if e = c.WriteFrame(protocol.Frame{Type: protocol.READY}); e != nil {
 		return e
 	}
 	_ = c.SetDeadline(time.Time{})
-	var codec relay.Relay
+	codec := relay.Relay{Counters: &svc.stats.Relay}
 	defer codec.Close()
 	var last uint64
 	idleRead := 3 * r.cfg.Pool.Heartbeat
@@ -237,6 +272,7 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) erro
 				return errors.New("wrong CLOSE id")
 			}
 			r.log.Info("connection retired", "event", "connection_retired", "service", svc.name, "reason", "server_close")
+			svc.stats.Retired("server_close")
 			return nil
 		case protocol.OPEN:
 			if last == math.MaxUint64 || f.LeaseID != last+1 {
@@ -248,9 +284,10 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) erro
 			svc.idle--
 			r.mu.Unlock()
 			svc.notify()
-			e = r.lease(c, s, svc.cfg, &codec, last)
+			e = r.lease(c, s, svc.cfg, &codec, last, svc.stats)
 			if errors.Is(e, errSurplus) {
 				r.log.Info("connection retired", "event", "connection_retired", "service", svc.name, "reason", "surplus")
+				svc.stats.Retired("surplus")
 				return nil
 			}
 			if e != nil {
@@ -261,12 +298,30 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) erro
 		}
 	}
 }
-func (r *runtime) lease(c *protocol.Conn, s *slot, cfg config.Service, codec *relay.Relay, id uint64) error {
+
+// lease serves one OPEN from the local dial to the release barrier and
+// records the outcome and duration on stats. Closing a surplus connection at
+// the barrier still completes the lease.
+func (r *runtime) lease(c *protocol.Conn, s *slot, cfg config.Service, codec *relay.Relay, id uint64, stats *metrics.Service) (err error) {
+	start := time.Now()
+	dialFailed := false
+	defer func() {
+		outcome := metrics.LeaseOK
+		switch {
+		case err != nil && !errors.Is(err, errSurplus):
+			outcome = metrics.LeaseError
+		case dialFailed:
+			outcome = metrics.LeaseDialFailed
+		}
+		stats.LeaseDone(outcome, time.Since(start))
+	}()
 	dctx, cancel := context.WithTimeout(context.Background(), r.cfg.DialTimeout)
 	defer cancel()
 	dialer := net.Dialer{Timeout: r.cfg.DialTimeout, KeepAlive: 30 * time.Second}
 	raw, e := dialer.DialContext(dctx, "tcp", cfg.Addr)
 	if e != nil {
+		dialFailed = true
+		stats.LocalDialFailures.Add(1)
 		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if e = c.WriteFrame(protocol.Frame{Type: protocol.OPEN_ERR, LeaseID: id, Payload: protocol.JSON(protocol.Code{Code: "dial_failed"})}); e != nil {
 			return e

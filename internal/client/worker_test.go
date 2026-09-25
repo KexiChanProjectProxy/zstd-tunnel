@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/config"
+	"github.com/kexichanprojectproxy/zstd-tunnel/internal/metrics"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/protocol"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/relay"
 )
@@ -35,7 +36,7 @@ func TestFailedOpenOKClosesLocalTCP(t *testing.T) {
 	s := &slot{}
 	done := make(chan error, 1)
 	go func() {
-		done <- r.lease(protocol.NewConn(failingWriteConn{left}), s, config.Service{Addr: ln.Addr().String()}, &relay.Relay{}, 1)
+		done <- r.lease(protocol.NewConn(failingWriteConn{left}), s, config.Service{Addr: ln.Addr().String()}, &relay.Relay{}, 1, &metrics.Service{})
 	}()
 	var conn *net.TCPConn
 	select {
@@ -82,7 +83,7 @@ func barrier(t *testing.T, idle, maxIdle int) (protocol.Frame, error, *slot) {
 	s := &slot{state: busySlot, svc: svc}
 	done := make(chan error, 1)
 	go func() {
-		done <- r.lease(protocol.NewConn(left), s, config.Service{Addr: closedAddr(t)}, &relay.Relay{}, 1)
+		done <- r.lease(protocol.NewConn(left), s, config.Service{Addr: closedAddr(t)}, &relay.Relay{}, 1, &metrics.Service{})
 	}()
 	server := protocol.NewConn(right)
 	_ = server.SetDeadline(time.Now().Add(3 * time.Second))
