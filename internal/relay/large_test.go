@@ -38,6 +38,7 @@ func TestRelayLargeCompressed(t *testing.T) {
 	defer right.Close()
 	meter := &countingConn{Conn: left}
 	var a, b Relay
+	a.Counters, b.Counters = &Counters{}, &Counters{}
 	defer a.Close()
 	defer b.Close()
 	done := make(chan error, 2)
@@ -70,5 +71,17 @@ func TestRelayLargeCompressed(t *testing.T) {
 	}
 	if meter.compressed >= len(data)/10 {
 		t.Fatalf("compressed DATA %d bytes exceeds 10%% of input", meter.compressed)
+	}
+	if got := a.Counters.ToTunnelRaw.Load(); got != uint64(len(data)) {
+		t.Fatalf("to_tunnel raw counter %d, sent %d", got, len(data))
+	}
+	if got := a.Counters.ToTunnelCompressed.Load(); got != uint64(meter.compressed) {
+		t.Fatalf("to_tunnel compressed counter %d, wire meter %d", got, meter.compressed)
+	}
+	if got := b.Counters.FromTunnelCompressed.Load(); got != uint64(meter.compressed) {
+		t.Fatalf("from_tunnel compressed counter %d, wire meter %d", got, meter.compressed)
+	}
+	if got := b.Counters.FromTunnelRaw.Load(); got != uint64(len(data)) {
+		t.Fatalf("from_tunnel raw counter %d, sent %d", got, len(data))
 	}
 }

@@ -27,6 +27,7 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 }
 func TestRelayInteractiveAndReuse(t *testing.T) {
 	var server, client Relay
+	server.Counters, client.Counters = &Counters{}, &Counters{}
 	defer server.Close()
 	defer client.Close()
 	for id := uint64(1); id <= 2; id++ {
@@ -73,6 +74,20 @@ func TestRelayInteractiveAndReuse(t *testing.T) {
 		_ = target.Close()
 		_ = s.Close()
 		_ = c.Close()
+	}
+	// Counters accumulate across both leases on the reused relays.
+	const payload = uint64(len("hello") + len("second lease"))
+	sc, cc := server.Counters, client.Counters
+	for name, got := range map[string]uint64{"server to_tunnel raw": sc.ToTunnelRaw.Load(), "server from_tunnel raw": sc.FromTunnelRaw.Load(), "client to_tunnel raw": cc.ToTunnelRaw.Load(), "client from_tunnel raw": cc.FromTunnelRaw.Load()} {
+		if got != payload {
+			t.Errorf("%s = %d, want %d", name, got, payload)
+		}
+	}
+	if a, b := sc.ToTunnelCompressed.Load(), cc.FromTunnelCompressed.Load(); a == 0 || a != b {
+		t.Errorf("server sent %d compressed bytes, client received %d", a, b)
+	}
+	if a, b := cc.ToTunnelCompressed.Load(), sc.FromTunnelCompressed.Load(); a == 0 || a != b {
+		t.Errorf("client sent %d compressed bytes, server received %d", a, b)
 	}
 }
 

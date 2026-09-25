@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -13,17 +14,36 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// Counters accumulates relayed payload bytes across every lease a Relay
+// runs. Directions are seen from this process: to_tunnel bytes are read raw
+// from the local TCP socket and written compressed into DATA frames;
+// from_tunnel bytes are read compressed from DATA frames and written raw to
+// the local socket. Frame headers and control frames are not counted.
+type Counters struct {
+	ToTunnelRaw, ToTunnelCompressed, FromTunnelCompressed, FromTunnelRaw atomic.Uint64
+}
+
+func add(c *atomic.Uint64, n int) {
+	if c != nil && n > 0 {
+		c.Add(uint64(n))
+	}
+}
+
 type Relay struct {
-	encoder *zstd.Encoder
-	decoder *zstd.Decoder
-	writer  frameWriter
-	reader  frameReader
-	readBuf [32768]byte
-	copyBuf [32768]byte
+	// Counters, when set, receives the byte counts of every lease. It is
+	// meant to be shared by all relays of one service and is never reset.
+	Counters *Counters
+	encoder  *zstd.Encoder
+	decoder  *zstd.Decoder
+	writer   frameWriter
+	reader   frameReader
+	readBuf  [32768]byte
+	copyBuf  [32768]byte
 }
 type frameWriter struct {
-	conn *protocol.Conn
-	id   uint64
+	conn  *protocol.Conn
+	id    uint64
+	bytes *atomic.Uint64
 }
 
 func (w *frameWriter) Write(p []byte) (int, error) {
@@ -35,6 +55,7 @@ func (w *frameWriter) Write(p []byte) (int, error) {
 		if e != nil {
 			return total, e
 		}
+		add(w.bytes, n)
 		p = p[n:]
 		total += n
 	}
@@ -46,6 +67,7 @@ type frameReader struct {
 	id      uint64
 	pending []byte
 	fin     bool
+	bytes   *atomic.Uint64
 }
 
 func (r *frameReader) Read(p []byte) (int, error) {
@@ -69,6 +91,8 @@ func (r *frameReader) Read(p []byte) (int, error) {
 	}
 	switch f.Type {
 	case protocol.DATA:
+		// Count on receipt: later calls serve the same bytes from pending.
+		add(r.bytes, len(f.Payload))
 		r.pending = f.Payload
 		n := copy(p, r.pending)
 		r.pending = r.pending[n:]
@@ -110,21 +134,31 @@ func (r *Relay) init() error {
 	return e
 }
 
-type deadlineWriter struct{ conn *net.TCPConn }
+type deadlineWriter struct {
+	conn  *net.TCPConn
+	bytes *atomic.Uint64
+}
 
 func (w deadlineWriter) Write(p []byte) (int, error) {
 	if e := w.conn.SetWriteDeadline(time.Now().Add(30 * time.Second)); e != nil {
 		return 0, e
 	}
-	return w.conn.Write(p)
+	n, e := w.conn.Write(p)
+	add(w.bytes, n)
+	return n, e
 }
 func (r *Relay) Run(ctx context.Context, tunnel *protocol.Conn, tcp *net.TCPConn, id uint64) error {
 	if e := r.init(); e != nil {
 		return e
 	}
+	var toRaw, toCompressed, fromCompressed, fromRaw *atomic.Uint64
+	if c := r.Counters; c != nil {
+		toRaw, toCompressed, fromCompressed, fromRaw = &c.ToTunnelRaw, &c.ToTunnelCompressed, &c.FromTunnelCompressed, &c.FromTunnelRaw
+	}
 	r.writer.conn = tunnel
 	r.writer.id = id
-	r.reader = frameReader{conn: tunnel, id: id}
+	r.writer.bytes = toCompressed
+	r.reader = frameReader{conn: tunnel, id: id, bytes: fromCompressed}
 	r.encoder.Reset(&r.writer)
 	if e := r.decoder.Reset(&r.reader); e != nil {
 		return e
@@ -137,6 +171,7 @@ func (r *Relay) Run(ctx context.Context, tunnel *protocol.Conn, tcp *net.TCPConn
 		for {
 			_ = tcp.SetReadDeadline(time.Time{})
 			n, e := tcp.Read(r.readBuf[:])
+			add(toRaw, n)
 			if n > 0 {
 				if _, err := r.encoder.Write(r.readBuf[:n]); err != nil {
 					errorsCh <- err
@@ -163,7 +198,7 @@ func (r *Relay) Run(ctx context.Context, tunnel *protocol.Conn, tcp *net.TCPConn
 		}
 	}()
 	go func() {
-		_, e := io.CopyBuffer(deadlineWriter{conn: tcp}, r.decoder, r.copyBuf[:])
+		_, e := io.CopyBuffer(deadlineWriter{conn: tcp, bytes: fromRaw}, r.decoder, r.copyBuf[:])
 		if e == nil {
 			e = r.reader.finish()
 		}
