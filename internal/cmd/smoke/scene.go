@@ -21,12 +21,24 @@ type scene struct {
 	fixtures                                                 map[string]*fixture
 	server, client                                           *process
 	serverKey, clientKey                                     keyPair
-	size                                                     int
+	pool                                                     poolSpec
 	timeout                                                  string
 }
 
-func newScene(ctx context.Context, binary, kind string, size int, timeout string, modes map[string]string) (_ *scene, err error) {
-	s := &scene{ctx: ctx, binary: binary, kind: kind, size: size, timeout: timeout, public: make(map[string]string), fixtures: make(map[string]*fixture)}
+// poolSpec is the [client.pool] table a scene writes.
+type poolSpec struct {
+	min, max                                              int
+	heartbeat, idle, idleJitter, lifetime, lifetimeJitter string
+}
+
+// steady keeps connections alive for the whole scene so that connection
+// reuse is observable.
+func steady(min, max int) poolSpec {
+	return poolSpec{min: min, max: max, heartbeat: "15s", idle: "10m", idleJitter: "0s", lifetime: "1h", lifetimeJitter: "0s"}
+}
+
+func newScene(ctx context.Context, binary, kind string, pool poolSpec, timeout string, modes map[string]string) (_ *scene, err error) {
+	s := &scene{ctx: ctx, binary: binary, kind: kind, pool: pool, timeout: timeout, public: make(map[string]string), fixtures: make(map[string]*fixture)}
 	dir, e := os.MkdirTemp("", "compress-proxy-smoke-")
 	if e != nil {
 		return nil, e
@@ -110,8 +122,9 @@ func (s *scene) writeConfigs(tokenOverride, clientKeyOverride, trustOverride str
 		}
 		client += fmt.Sprintf("[client.transport.tls]\nca_file=%s\nserver_name=%s\n", quote(ca), quote(hostname))
 	}
-	server += fmt.Sprintf("[server.pool]\nmax_connections=%d\nmax_pending=64\nacquire_timeout=%s\n", s.size, quote(s.timeout))
-	client += fmt.Sprintf("[client.pool]\nsize=%d\n", s.size)
+	server += fmt.Sprintf("[server.pool]\nmax_pending=64\nacquire_timeout=%s\n", quote(s.timeout))
+	pl := s.pool
+	client += fmt.Sprintf("[client.pool]\nmin_idle=%d\nmax_idle=%d\nheartbeat=%s\nidle_timeout=%s\nidle_jitter=%s\nmax_lifetime=%s\nlifetime_jitter=%s\n", pl.min, pl.max, quote(pl.heartbeat), quote(pl.idle), quote(pl.idleJitter), quote(pl.lifetime), quote(pl.lifetimeJitter))
 	for name, fixture := range s.fixtures {
 		server += fmt.Sprintf("[server.services.%s]\nbind_addr=%s\n", name, quote(s.public[name]))
 		client += fmt.Sprintf("[client.services.%s]\nlocal_addr=%s\n", name, quote(fixture.addr()))
@@ -196,6 +209,55 @@ func (s *scene) restartServer() error {
 	_, e = s.server.waitEvent(s.ctx, 60*time.Second, func(ev event) bool { return ev["event"] == "pool_ready" })
 	return e
 }
+func (s *scene) readyCount(name string) int {
+	n := 0
+	for _, ev := range s.server.events() {
+		if ev["event"] == "pool_ready" && ev["service"] == name {
+			n++
+		}
+	}
+	return n
+}
+
+// stopClient terminates the client and waits until the server has closed
+// every tunnel connection it had registered.
+func (s *scene) stopClient() error {
+	s.client.signal(syscall.SIGTERM)
+	if e := s.client.wait(5 * time.Second); e != nil {
+		return e
+	}
+	s.client = nil
+	_, e := s.server.waitEvent(s.ctx, 5*time.Second, func(event) bool {
+		open := map[any]bool{}
+		for _, ev := range s.server.events() {
+			switch ev["event"] {
+			case "pool_ready":
+				open[ev["connection_id"]] = true
+			case "connection_closed":
+				delete(open, ev["connection_id"])
+			}
+		}
+		return len(open) == 0
+	})
+	return e
+}
+func (s *scene) restartClient() error {
+	before := map[string]int{}
+	for name := range s.fixtures {
+		before[name] = s.readyCount(name)
+	}
+	var e error
+	s.client, e = startProcess(s.ctx, s.binary, "client", "-c", s.clientFile)
+	if e != nil {
+		return e
+	}
+	for name := range s.fixtures {
+		if _, e = s.server.waitEvent(s.ctx, 5*time.Second, func(event) bool { return s.readyCount(name) > before[name] }); e != nil {
+			return e
+		}
+	}
+	return nil
+}
 func (s *scene) close() {
 	if s.client != nil {
 		s.client.signal(syscall.SIGTERM)
@@ -248,55 +310,64 @@ func (s *scene) stopIdle() error {
 	}
 	return nil
 }
-func (s *scene) assertUnique(name string, leases int) error {
-	_, err := s.server.waitEvent(s.ctx, 5*time.Second, func(event) bool {
-		count := 0
-		for _, ev := range s.server.events() {
-			if ev["event"] == "pool_ready" && ev["service"] == name {
-				count++
-			}
-		}
-		return count >= leases+1
-	})
-	if err != nil {
-		return err
+
+// assertReuse checks that serial leases were carried by a small number of
+// long-lived tunnel connections, that lease IDs on each connection run
+// 1,2,3..., and that no connection started a lease before its previous
+// lease passed the release barrier.
+func (s *scene) assertReuse(name string, leases int) error {
+	if e := s.awaitFinished(name, leases); e != nil {
+		return e
 	}
-	events := s.server.events()
-	var id float64
-	var prev float64
-	count, finished, readyAfter := 0, 0, 0
-	awaitingReady := false
-	for _, ev := range events {
+	type conn struct {
+		last          float64
+		leases        int
+		awaitingReady bool
+	}
+	conns := map[float64]*conn{}
+	started, finished := 0, 0
+	for _, ev := range s.server.events() {
 		if ev["service"] != name {
 			continue
 		}
+		id, _ := ev["connection_id"].(float64)
+		c := conns[id]
+		if c == nil {
+			c = &conn{}
+			conns[id] = c
+		}
 		switch ev["event"] {
 		case "pool_ready":
-			if awaitingReady {
-				readyAfter++
-				awaitingReady = false
-			}
+			c.awaitingReady = false
 		case "lease_started":
-			if awaitingReady {
-				return fmt.Errorf("lease %d started before prior release barrier", count+1)
-			}
-			current, _ := ev["connection_id"].(float64)
 			lease, _ := ev["lease_id"].(float64)
-			if count > 0 && (current != id || lease != prev+1) {
-				return fmt.Errorf("lease changed physical connection/id: %v after %v/%v", ev, id, prev)
+			if c.awaitingReady {
+				return fmt.Errorf("connection %.0f lease %.0f started before prior release barrier", id, lease)
 			}
-			id = current
-			prev = lease
-			count++
+			if lease != c.last+1 {
+				return fmt.Errorf("connection %.0f lease id %.0f after %.0f", id, lease, c.last)
+			}
+			c.last = lease
+			c.leases++
+			started++
 		case "lease_finished":
 			finished++
-			awaitingReady = true
+			c.awaitingReady = true
 		}
 	}
-	if count != leases || finished != leases || readyAfter != leases || awaitingReady {
-		return fmt.Errorf("lease log counts started=%d finished=%d ready-after-barrier=%d expected %d", count, finished, readyAfter, leases)
+	used := 0
+	for _, c := range conns {
+		if c.leases > 0 {
+			used++
+		}
 	}
-	fmt.Printf("evidence %s connection_id=%.0f lease_id=1..%.0f\n", name, id, prev)
+	if started != leases || finished != leases {
+		return fmt.Errorf("lease log counts started=%d finished=%d expected %d", started, finished, leases)
+	}
+	if used > 2 {
+		return fmt.Errorf("%d serial leases used %d tunnel connections", leases, used)
+	}
+	fmt.Printf("evidence %s leases=%d connections=%d\n", name, leases, used)
 	return nil
 }
 func (s *scene) awaitFinished(name string, count int) error {

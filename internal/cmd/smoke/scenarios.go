@@ -18,10 +18,18 @@ func scenarios(ctx context.Context, binary, kind string) error {
 	if e := basicScenarios(ctx, binary, kind); e != nil {
 		return e
 	}
-	if e := poolCapacity(ctx, binary, kind); e != nil {
-		return fmt.Errorf("pool-capacity: %w", e)
+	if e := poolGrowth(ctx, binary, kind); e != nil {
+		return fmt.Errorf("pool-growth: %w", e)
 	}
-	pass(kind, "pool-capacity")
+	pass(kind, "pool-growth")
+	if e := idleExpiry(ctx, binary, kind); e != nil {
+		return fmt.Errorf("idle-expiry: %w", e)
+	}
+	pass(kind, "idle-expiry")
+	if e := maxLifetime(ctx, binary, kind); e != nil {
+		return fmt.Errorf("max-lifetime: %w", e)
+	}
+	pass(kind, "max-lifetime")
 	if e := authentication(ctx, binary, kind); e != nil {
 		return fmt.Errorf("authentication: %w", e)
 	}
@@ -33,7 +41,11 @@ func scenarios(ctx context.Context, binary, kind string) error {
 	return nil
 }
 func basicScenarios(ctx context.Context, binary, kind string) error {
-	s, e := newScene(ctx, binary, kind, 1, "400ms", map[string]string{"echo": "echo", "digest": "digest", "hold": "hold", "tagA": "tagA", "tagB": "tagB", "flaky": "echo"})
+	// A short heartbeat lets the server notice a stopped client quickly:
+	// idle connections are only probed by heartbeats.
+	pool := steady(1, 2)
+	pool.heartbeat = "1s"
+	s, e := newScene(ctx, binary, kind, pool, "400ms", map[string]string{"echo": "echo", "digest": "digest", "hold": "hold", "tagA": "tagA", "tagB": "tagB", "flaky": "echo"})
 	if e != nil {
 		return e
 	}
@@ -59,39 +71,33 @@ func basicScenarios(ctx context.Context, binary, kind string) error {
 			return fmt.Errorf("serial-reuse #%d: %w", i, e)
 		}
 	}
-	if e = s.awaitFinished("digest", 102); e != nil {
-		return e
-	}
-	if e = s.assertUnique("digest", 102); e != nil {
+	if e = s.assertReuse("digest", 102); e != nil {
 		return e
 	}
 	pass(kind, "serial-reuse")
-	first, e := s.connect("hold")
+	// With no client connected, a visitor waits acquire_timeout and is closed.
+	if e = s.stopClient(); e != nil {
+		return e
+	}
+	waiting, e := s.connect("hold")
 	if e != nil {
 		return e
 	}
-	defer first.Close()
-	h, e := s.fixtures["hold"].next(ctx, 2*time.Second)
-	if e != nil {
-		return e
-	}
-	second, e := s.connect("hold")
-	if e != nil {
-		return e
-	}
-	defer second.Close()
-	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	started := time.Now()
+	_ = waiting.SetReadDeadline(time.Now().Add(2 * time.Second))
 	var one [1]byte
-	_, e = second.Read(one[:])
+	_, e = waiting.Read(one[:])
+	_ = waiting.Close()
 	if !errors.Is(e, io.EOF) {
 		return fmt.Errorf("acquire-timeout expected EOF: %w", e)
 	}
-	_ = first.CloseWrite()
-	close(h.release)
-	if _, e = io.ReadFull(first, one[:]); e != nil || one[0] != 'h' {
-		return fmt.Errorf("active lease damaged: %v", e)
+	if elapsed := time.Since(started); elapsed < 300*time.Millisecond {
+		return fmt.Errorf("visitor closed after %v, before acquire_timeout", elapsed)
 	}
-	if _, e = io.ReadAll(first); e != nil {
+	if e = s.restartClient(); e != nil {
+		return e
+	}
+	if e = echo(s, "echo", []byte("after client restart")); e != nil {
 		return e
 	}
 	pass(kind, "acquire-timeout")
@@ -128,10 +134,7 @@ func basicScenarios(ctx context.Context, binary, kind string) error {
 	if e = echo(s, "flaky", []byte("restored")); e != nil {
 		return e
 	}
-	if e = s.awaitFinished("flaky", 2); e != nil {
-		return e
-	}
-	if e = s.assertUnique("flaky", 2); e != nil {
+	if e = s.assertReuse("flaky", 2); e != nil {
 		return e
 	}
 	pass(kind, "local-dial-failure")
@@ -140,7 +143,7 @@ func basicScenarios(ctx context.Context, binary, kind string) error {
 		return e
 	}
 	defer c.Close()
-	h, e = s.fixtures["hold"].next(ctx, 2*time.Second)
+	h, e := s.fixtures["hold"].next(ctx, 2*time.Second)
 	if e != nil {
 		return e
 	}
@@ -210,8 +213,23 @@ func digest(s *scene, data []byte) error {
 	}
 	return nil
 }
-func poolCapacity(ctx context.Context, binary, kind string) error {
-	s, e := newScene(ctx, binary, kind, 2, "3s", map[string]string{"hold": "hold"})
+
+// countEvents counts server events for a service matching event and,
+// when reason is set, the close reason.
+func countEvents(s *scene, service, name, reason string) int {
+	n := 0
+	for _, ev := range s.server.events() {
+		if ev["service"] == service && ev["event"] == name && (reason == "" || ev["reason"] == reason) {
+			n++
+		}
+	}
+	return n
+}
+
+// poolGrowth: busy connections are replaced so the pool keeps min_idle idle
+// connections, and connections beyond max_idle are closed on release.
+func poolGrowth(ctx context.Context, binary, kind string) error {
+	s, e := newScene(ctx, binary, kind, steady(1, 2), "3s", map[string]string{"hold": "hold"})
 	if e != nil {
 		return e
 	}
@@ -221,43 +239,21 @@ func poolCapacity(ctx context.Context, binary, kind string) error {
 	}
 	c := make([]*net.TCPConn, 3)
 	h := make([]*held, 3)
-	for i := range 2 {
+	for i := range 3 {
 		c[i], e = s.connect("hold")
 		if e != nil {
 			return e
 		}
 		defer c[i].Close()
-		h[i], e = s.fixtures["hold"].next(ctx, 2*time.Second)
+		h[i], e = s.fixtures["hold"].next(ctx, 3*time.Second)
 		if e != nil {
-			return e
+			return fmt.Errorf("visitor %d not served: %w", i+1, e)
 		}
 	}
-	c[2], e = s.connect("hold")
-	if e != nil {
-		return e
-	}
-	defer c[2].Close()
-	select {
-	case <-s.fixtures["hold"].arrival:
-		return errors.New("third entered occupied pool")
-	case <-time.After(200 * time.Millisecond):
-	}
-	_ = c[0].CloseWrite()
-	close(h[0].release)
-	var b [1]byte
-	if _, e = io.ReadFull(c[0], b[:]); e != nil {
-		return e
-	}
-	if _, e = io.ReadAll(c[0]); e != nil {
-		return e
-	}
-	h[2], e = s.fixtures["hold"].next(ctx, 3*time.Second)
-	if e != nil {
-		return e
-	}
-	for i := 1; i <= 2; i++ {
+	for i := range 3 {
 		_ = c[i].CloseWrite()
 		close(h[i].release)
+		var b [1]byte
 		if _, e = io.ReadFull(c[i], b[:]); e != nil {
 			return e
 		}
@@ -274,8 +270,99 @@ func poolCapacity(ctx context.Context, binary, kind string) error {
 			seen[ev["connection_id"]] = true
 		}
 	}
-	if len(seen) > 2 {
-		return fmt.Errorf("pool created %d connections", len(seen))
+	if len(seen) != 3 {
+		return fmt.Errorf("3 concurrent leases used %d connections", len(seen))
+	}
+	if _, e = s.server.waitEvent(ctx, 3*time.Second, func(event) bool { return countEvents(s, "hold", "connection_closed", "client_close") >= 2 }); e != nil {
+		return fmt.Errorf("surplus idle connections not closed: %w", e)
+	}
+	select {
+	case <-time.After(300 * time.Millisecond):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if n := countEvents(s, "hold", "connection_closed", "client_close"); n != 2 {
+		return fmt.Errorf("%d surplus closes, want 2", n)
+	}
+	return echoHold(s)
+}
+
+// echoHold proves the hold service still serves after pool changes.
+func echoHold(s *scene) error {
+	c, e := s.connect("hold")
+	if e != nil {
+		return e
+	}
+	defer c.Close()
+	h, e := s.fixtures["hold"].next(s.ctx, 3*time.Second)
+	if e != nil {
+		return e
+	}
+	_ = c.CloseWrite()
+	close(h.release)
+	var b [1]byte
+	if _, e = io.ReadFull(c, b[:]); e != nil {
+		return e
+	}
+	_, e = io.ReadAll(c)
+	return e
+}
+
+// idleExpiry: an unused connection is closed after idle_timeout plus jitter
+// and replaced, without disturbing service.
+func idleExpiry(ctx context.Context, binary, kind string) error {
+	pool := steady(1, 1)
+	pool.idle, pool.idleJitter = "1s", "300ms"
+	s, e := newScene(ctx, binary, kind, pool, "2s", map[string]string{"echo": "echo"})
+	if e != nil {
+		return e
+	}
+	defer s.close()
+	if e = s.start(); e != nil {
+		return e
+	}
+	started := time.Now()
+	if _, e = s.server.waitEvent(ctx, 3*time.Second, func(event) bool { return countEvents(s, "echo", "connection_closed", "expired") >= 1 }); e != nil {
+		return fmt.Errorf("idle connection not expired: %w", e)
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		return fmt.Errorf("expired after %v, before idle_timeout", elapsed)
+	}
+	if _, e = s.server.waitEvent(ctx, 3*time.Second, func(event) bool { return s.readyCount("echo") >= 2 }); e != nil {
+		return fmt.Errorf("expired connection not replaced: %w", e)
+	}
+	return echo(s, "echo", []byte("after idle expiry"))
+}
+
+// maxLifetime: a connection that is always busy still retires once it
+// outlives max_lifetime, and traffic moves to a newer connection.
+func maxLifetime(ctx context.Context, binary, kind string) error {
+	pool := steady(1, 2)
+	pool.lifetime = "2s"
+	s, e := newScene(ctx, binary, kind, pool, "2s", map[string]string{"echo": "echo"})
+	if e != nil {
+		return e
+	}
+	defer s.close()
+	if e = s.start(); e != nil {
+		return e
+	}
+	for until := time.Now().Add(4 * time.Second); time.Now().Before(until); {
+		if e = echo(s, "echo", []byte("lifetime")); e != nil {
+			return fmt.Errorf("lease failed during rotation: %w", e)
+		}
+	}
+	if countEvents(s, "echo", "connection_closed", "expired") == 0 {
+		return errors.New("no connection retired by max_lifetime")
+	}
+	seen := map[any]bool{}
+	for _, ev := range s.server.events() {
+		if ev["event"] == "lease_started" {
+			seen[ev["connection_id"]] = true
+		}
+	}
+	if len(seen) < 2 {
+		return fmt.Errorf("leases stayed on %d connection", len(seen))
 	}
 	return nil
 }
@@ -300,7 +387,7 @@ func authentication(ctx context.Context, binary, kind string) error {
 	return nil
 }
 func authenticationVariant(ctx context.Context, binary, kind, variant string) error {
-	s, e := newScene(ctx, binary, kind, 1, "400ms", map[string]string{"echo": "echo"})
+	s, e := newScene(ctx, binary, kind, steady(1, 2), "400ms", map[string]string{"echo": "echo"})
 	if e != nil {
 		return e
 	}
@@ -385,7 +472,7 @@ func authenticationVariant(ctx context.Context, binary, kind, variant string) er
 }
 func shutdownScenarios(ctx context.Context, binary, kind string) error {
 	for _, hung := range []bool{false, true} {
-		s, e := newScene(ctx, binary, kind, 1, "1s", map[string]string{"hold": "hold"})
+		s, e := newScene(ctx, binary, kind, steady(1, 2), "1s", map[string]string{"hold": "hold"})
 		if e != nil {
 			return e
 		}
