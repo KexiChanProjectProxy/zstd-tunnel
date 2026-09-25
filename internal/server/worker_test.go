@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,5 +228,52 @@ func TestPoolOptionsValidation(t *testing.T) {
 		if _, e := poolOptions(p); e == nil {
 			t.Fatal(name, "accepted")
 		}
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+func (b *syncBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buf.String() }
+
+// pool_ready marks a connection entering the idle pool after registration or
+// a lease. Heartbeat checks must not log it again, or every idle connection
+// would emit one per heartbeat interval.
+func TestHeartbeatDoesNotRepeatPoolReady(t *testing.T) {
+	var logs syncBuffer
+	r := &runtime{log: slog.New(slog.NewJSONHandler(&logs, nil))}
+	left, right := net.Pipe()
+	defer right.Close()
+	server := protocol.NewConn(left)
+	client := protocol.NewConn(right)
+	p := pool.New(1)
+	w, _ := p.Register(1, pool.Options{Heartbeat: 20 * time.Millisecond}, func() { _ = left.Close() })
+	done := make(chan struct{})
+	go func() { defer close(done); r.work(server, w, "svc") }()
+	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+	for range 3 {
+		f, e := client.ReadFrame()
+		if e != nil || f.Type != protocol.PING {
+			t.Fatalf("PING: %v", e)
+		}
+		if e = client.WriteFrame(protocol.Frame{Type: protocol.PONG, Payload: f.Payload}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	_ = right.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after the tunnel closed")
+	}
+	if n := strings.Count(logs.String(), `"event":"pool_ready"`); n != 1 {
+		t.Fatalf("pool_ready logged %d times across 3 heartbeats, want 1:\n%s", n, logs.String())
 	}
 }

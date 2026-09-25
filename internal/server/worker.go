@@ -149,10 +149,16 @@ func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
 	defer codec.Close()
 	var last uint64
 	outcome := w.Idle()
+	// checked is set when the worker returns to the idle pool after a
+	// heartbeat. pool_ready is only logged for registration and leases, so
+	// idle connections do not repeat it every heartbeat interval.
+	checked := false
 	for {
 		switch outcome {
 		case pool.Ready:
-			r.log.Info("connection ready", "event", "pool_ready", "service", service, "connection_id", w.ID)
+			if !checked {
+				r.log.Info("connection ready", "event", "pool_ready", "service", service, "connection_id", w.ID)
+			}
 		case pool.Expired:
 			reason = "expired"
 			goodbye(conn)
@@ -162,12 +168,14 @@ func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
 			return
 		}
 		tcp, next := w.Next(context.Background())
+		checked = false
 		switch next {
 		case pool.Check:
 			if heartbeat(conn) != nil {
 				return
 			}
 			outcome = w.Idle()
+			checked = true
 			continue
 		case pool.Expired:
 			reason = "expired"
