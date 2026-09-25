@@ -18,6 +18,10 @@ func scenarios(ctx context.Context, binary, kind string) error {
 	if e := basicScenarios(ctx, binary, kind); e != nil {
 		return e
 	}
+	if e := metricsScenario(ctx, binary, kind); e != nil {
+		return fmt.Errorf("metrics: %w", e)
+	}
+	pass(kind, "metrics")
 	if e := poolGrowth(ctx, binary, kind); e != nil {
 		return fmt.Errorf("pool-growth: %w", e)
 	}

@@ -23,6 +23,8 @@ type scene struct {
 	serverKey, clientKey                                     keyPair
 	pool                                                     poolSpec
 	timeout                                                  string
+	// Every scene enables the metrics endpoint on both processes.
+	serverMetrics, clientMetrics, metricsUser, metricsPass string
 }
 
 // poolSpec is the [client.pool] table a scene writes.
@@ -61,10 +63,14 @@ func newScene(ctx context.Context, binary, kind string, pool poolSpec, timeout s
 		}
 		s.public[name] = addr
 	}
-	s.tunnel, e = freeAddr()
-	if e != nil {
+	if e = s.allocateAddrs(); e != nil {
 		return nil, e
 	}
+	password := make([]byte, 24)
+	if _, e = rand.Read(password); e != nil {
+		return nil, e
+	}
+	s.metricsUser, s.metricsPass = "prom", base64.StdEncoding.EncodeToString(password)
 	s.serverKey, e = generateKey(ctx, binary)
 	if e != nil {
 		return nil, e
@@ -87,6 +93,18 @@ func newScene(ctx context.Context, binary, kind string, pool poolSpec, timeout s
 	s.clientFile = filepath.Join(dir, "client.toml")
 	e = s.writeConfigs("", "", "")
 	return s, e
+}
+
+// allocateAddrs picks the tunnel and metrics listen addresses.
+func (s *scene) allocateAddrs() error {
+	for _, dst := range []*string{&s.tunnel, &s.serverMetrics, &s.clientMetrics} {
+		addr, e := freeAddr()
+		if e != nil {
+			return e
+		}
+		*dst = addr
+	}
+	return nil
 }
 func (s *scene) writeConfigs(tokenOverride, clientKeyOverride, trustOverride string) error {
 	clientToken := s.token
@@ -125,6 +143,8 @@ func (s *scene) writeConfigs(tokenOverride, clientKeyOverride, trustOverride str
 	server += fmt.Sprintf("[server.pool]\nmax_pending=64\nacquire_timeout=%s\n", quote(s.timeout))
 	pl := s.pool
 	client += fmt.Sprintf("[client.pool]\nmin_idle=%d\nmax_idle=%d\nheartbeat=%s\nidle_timeout=%s\nidle_jitter=%s\nmax_lifetime=%s\nlifetime_jitter=%s\n", pl.min, pl.max, quote(pl.heartbeat), quote(pl.idle), quote(pl.idleJitter), quote(pl.lifetime), quote(pl.lifetimeJitter))
+	server += fmt.Sprintf("[server.metrics]\nbind_addr=%s\nusername=%s\npassword=%s\n", quote(s.serverMetrics), quote(s.metricsUser), quote(s.metricsPass))
+	client += fmt.Sprintf("[client.metrics]\nbind_addr=%s\nusername=%s\npassword=%s\n", quote(s.clientMetrics), quote(s.metricsUser), quote(s.metricsPass))
 	for name, fixture := range s.fixtures {
 		server += fmt.Sprintf("[server.services.%s]\nbind_addr=%s\n", name, quote(s.public[name]))
 		client += fmt.Sprintf("[client.services.%s]\nlocal_addr=%s\n", name, quote(fixture.addr()))
@@ -167,12 +187,14 @@ func (s *scene) start() error {
 			}
 			s.public[name] = addr
 		}
-		var e error
-		s.tunnel, e = freeAddr()
-		if e != nil {
+		if s.client != nil {
+			_ = s.client.wait(time.Second)
+			s.client = nil
+		}
+		if e := s.allocateAddrs(); e != nil {
 			return e
 		}
-		if e = s.writeConfigs("", "", ""); e != nil {
+		if e := s.writeConfigs("", "", ""); e != nil {
 			return e
 		}
 	}
@@ -195,7 +217,9 @@ func (s *scene) startOnce() error {
 	}
 	for name := range s.fixtures {
 		if _, e = s.server.waitEvent(s.ctx, 5*time.Second, func(ev event) bool { return ev["event"] == "pool_ready" && ev["service"] == name }); e != nil {
-			return e
+			// Include the client's stderr so a client bind failure is
+			// recognised and retried by start.
+			return fmt.Errorf("%w; client stderr: %s", e, s.client.output())
 		}
 	}
 	return nil
