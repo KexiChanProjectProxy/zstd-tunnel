@@ -58,3 +58,69 @@ func TestFailedOpenOKClosesLocalTCP(t *testing.T) {
 		t.Fatalf("local TCP leaked after OPEN_OK failure: %v", e)
 	}
 }
+
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	ln, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+// barrier drives one failed-dial lease through RELEASE and returns the
+// frame the client answered with.
+func barrier(t *testing.T, idle, maxIdle int) (protocol.Frame, error, *slot) {
+	t.Helper()
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	svc := &service{name: "svc", idle: idle}
+	r := &runtime{cfg: &config.Client{DialTimeout: time.Second, Pool: config.ClientPool{MinIdle: 1, MaxIdle: maxIdle}}}
+	s := &slot{state: busySlot, svc: svc}
+	done := make(chan error, 1)
+	go func() {
+		done <- r.lease(protocol.NewConn(left), s, config.Service{Addr: closedAddr(t)}, &relay.Relay{}, 1)
+	}()
+	server := protocol.NewConn(right)
+	_ = server.SetDeadline(time.Now().Add(3 * time.Second))
+	if f, e := server.ReadFrame(); e != nil || f.Type != protocol.OPEN_ERR {
+		t.Fatalf("OPEN_ERR: %v", e)
+	}
+	if e := server.WriteFrame(protocol.Frame{Type: protocol.RELEASE, LeaseID: 1}); e != nil {
+		t.Fatal(e)
+	}
+	f, e := server.ReadFrame()
+	if e != nil {
+		t.Fatal(e)
+	}
+	f.Payload = nil
+	select {
+	case e = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("lease blocked")
+	}
+	return f, e, s
+}
+
+func TestSurplusIdleClosesAtBarrier(t *testing.T) {
+	f, e, s := barrier(t, 1, 1)
+	if f.Type != protocol.CLOSE || f.LeaseID != 0 || !errors.Is(e, errSurplus) {
+		t.Fatalf("frame %d error %v", f.Type, e)
+	}
+	if s.state != busySlot || s.svc.idle != 1 {
+		t.Fatal("surplus connection counted as idle")
+	}
+}
+
+func TestReturnsToIdleBelowMax(t *testing.T) {
+	f, e, s := barrier(t, 1, 2)
+	if f.Type != protocol.READY || f.LeaseID != 1 || e != nil {
+		t.Fatalf("frame %d error %v", f.Type, e)
+	}
+	if s.state != idleSlot || s.svc.idle != 2 {
+		t.Fatal("returned connection not counted as idle")
+	}
+}

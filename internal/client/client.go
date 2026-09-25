@@ -11,15 +11,14 @@ import (
 )
 
 func Run(ctx context.Context, cfg *config.Client) error {
-	if cfg == nil || len(cfg.Services) == 0 || cfg.Pool.Size < 1 {
+	if cfg == nil || len(cfg.Services) == 0 || config.ValidatePool(cfg.Pool) != nil {
 		return errors.New("invalid client configuration")
 	}
 	r := &runtime{cfg: cfg, log: slog.New(slog.NewJSONHandler(os.Stderr, nil)), slots: make(map[*slot]struct{})}
-	for name, service := range cfg.Services {
-		for range cfg.Pool.Size {
-			r.wg.Add(1)
-			go r.runSlot(ctx, name, service)
-		}
+	for name, cfg := range cfg.Services {
+		svc := &service{name: name, cfg: cfg, wake: make(chan struct{}, 1), backoff: baseBackoff}
+		r.wg.Add(1)
+		go r.control(ctx, svc)
 	}
 	<-ctx.Done()
 	drainDeadline := time.Now().Add(30 * time.Second)

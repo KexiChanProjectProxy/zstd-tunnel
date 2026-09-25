@@ -43,10 +43,13 @@ type Client struct {
 	Pool        ClientPool
 }
 type ServerPool struct {
-	MaxConnections, MaxPending int
-	AcquireTimeout             time.Duration
+	MaxPending     int
+	AcquireTimeout time.Duration
 }
-type ClientPool struct{ Size int }
+type ClientPool struct {
+	MinIdle, MaxIdle                                                int
+	Heartbeat, IdleTimeout, IdleJitter, MaxLifetime, LifetimeJitter time.Duration
+}
 type ServerTransport struct {
 	Type                string
 	PrivateKey, PeerKey []byte
@@ -105,12 +108,17 @@ type rawWS struct {
 	Path *string `toml:"path"`
 }
 type rawServerPool struct {
-	MaxConnections *int    `toml:"max_connections"`
 	MaxPending     *int    `toml:"max_pending"`
 	AcquireTimeout *string `toml:"acquire_timeout"`
 }
 type rawClientPool struct {
-	Size *int `toml:"size"`
+	MinIdle        *int    `toml:"min_idle"`
+	MaxIdle        *int    `toml:"max_idle"`
+	Heartbeat      *string `toml:"heartbeat"`
+	IdleTimeout    *string `toml:"idle_timeout"`
+	IdleJitter     *string `toml:"idle_jitter"`
+	MaxLifetime    *string `toml:"max_lifetime"`
+	LifetimeJitter *string `toml:"lifetime_jitter"`
 }
 
 func Load(path string) (cfg *Config, err error) {
@@ -160,10 +168,7 @@ func Load(path string) (cfg *Config, err error) {
 		if err != nil {
 			return nil, err
 		}
-		p := ServerPool{MaxConnections: 4, MaxPending: 64, AcquireTimeout: 5 * time.Second}
-		if r.Pool.MaxConnections != nil {
-			p.MaxConnections = *r.Pool.MaxConnections
-		}
+		p := ServerPool{MaxPending: 64, AcquireTimeout: 5 * time.Second}
 		if r.Pool.MaxPending != nil {
 			p.MaxPending = *r.Pool.MaxPending
 		}
@@ -173,7 +178,7 @@ func Load(path string) (cfg *Config, err error) {
 				return nil, errors.New("server.pool.acquire_timeout: invalid duration")
 			}
 		}
-		if p.MaxConnections < 1 || p.MaxConnections > 1024 || p.MaxPending < 1 || p.MaxPending > 4096 || p.AcquireTimeout <= 0 || p.AcquireTimeout > time.Minute {
+		if p.MaxPending < 1 || p.MaxPending > 4096 || p.AcquireTimeout <= 0 || p.AcquireTimeout > time.Minute {
 			return nil, errors.New("server.pool: invalid limits")
 		}
 		return &Config{Server: &Server{BindAddr: r.BindAddr, Services: services, Transport: tr, Pool: p}}, nil
@@ -200,16 +205,69 @@ func Load(path string) (cfg *Config, err error) {
 	if timeout <= 0 || timeout > 5*time.Second {
 		return nil, errors.New("client.dial_timeout: out of range")
 	}
-	size := 4
-	if r.Pool.Size != nil {
-		size = *r.Pool.Size
-	}
-	if size < 1 || size > 1024 {
-		return nil, errors.New("client.pool.size: out of range")
+	pool, err := clientPool(r.Pool)
+	if err != nil {
+		return nil, err
 	}
 	tr.RemoteAddr = r.RemoteAddr
 	tr.DialTimeout = timeout
-	return &Config{Client: &Client{RemoteAddr: r.RemoteAddr, DialTimeout: timeout, Services: services, Transport: tr, Pool: ClientPool{Size: size}}}, nil
+	return &Config{Client: &Client{RemoteAddr: r.RemoteAddr, DialTimeout: timeout, Services: services, Transport: tr, Pool: pool}}, nil
+}
+
+func clientPool(r rawClientPool) (ClientPool, error) {
+	p := ClientPool{MinIdle: 2, MaxIdle: 8, Heartbeat: 15 * time.Second, IdleTimeout: 5 * time.Minute, MaxLifetime: time.Hour}
+	if r.MinIdle != nil {
+		p.MinIdle = *r.MinIdle
+	}
+	if r.MaxIdle != nil {
+		p.MaxIdle = *r.MaxIdle
+	}
+	for _, d := range []struct {
+		name string
+		raw  *string
+		dst  *time.Duration
+	}{{"heartbeat", r.Heartbeat, &p.Heartbeat}, {"idle_timeout", r.IdleTimeout, &p.IdleTimeout}, {"max_lifetime", r.MaxLifetime, &p.MaxLifetime}, {"idle_jitter", r.IdleJitter, &p.IdleJitter}, {"lifetime_jitter", r.LifetimeJitter, &p.LifetimeJitter}} {
+		if d.raw == nil {
+			continue
+		}
+		v, e := time.ParseDuration(*d.raw)
+		if e != nil {
+			return p, fmt.Errorf("client.pool.%s: invalid duration", d.name)
+		}
+		*d.dst = v
+	}
+	if r.IdleJitter == nil {
+		p.IdleJitter = p.IdleTimeout / 10
+	}
+	if r.LifetimeJitter == nil {
+		p.LifetimeJitter = p.MaxLifetime / 10
+	}
+	if e := ValidatePool(p); e != nil {
+		return p, fmt.Errorf("client.pool.%w", e)
+	}
+	return p, nil
+}
+
+// ValidatePool checks the pool limits shared by client configuration and
+// the parameters a client announces to the server in HELLO.
+func ValidatePool(p ClientPool) error {
+	switch {
+	case p.MinIdle < 1 || p.MinIdle > 1024:
+		return errors.New("min_idle: out of range")
+	case p.MaxIdle < p.MinIdle || p.MaxIdle > 1024:
+		return errors.New("max_idle: must be min_idle..1024")
+	case p.Heartbeat < time.Second || p.Heartbeat > 10*time.Minute:
+		return errors.New("heartbeat: out of range")
+	case p.IdleTimeout < time.Second || p.IdleTimeout > 24*time.Hour:
+		return errors.New("idle_timeout: out of range")
+	case p.IdleJitter < 0 || p.IdleJitter > p.IdleTimeout:
+		return errors.New("idle_jitter: must be 0..idle_timeout")
+	case p.MaxLifetime < time.Second || p.MaxLifetime > 7*24*time.Hour:
+		return errors.New("max_lifetime: out of range")
+	case p.LifetimeJitter < 0 || p.LifetimeJitter > p.MaxLifetime:
+		return errors.New("lifetime_jitter: must be 0..max_lifetime")
+	}
+	return nil
 }
 
 func address(s string, requireHost bool) error {

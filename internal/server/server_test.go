@@ -45,8 +45,8 @@ func TestNoiseEndToEnd(t *testing.T) {
 	ck, _ := noise.DH25519.GenerateKeypair(rand.Reader)
 	tunnel, public := freePort(t), freePort(t)
 	token := "a long random-looking token for testing!"
-	srvcfg := &config.Server{BindAddr: tunnel, Services: map[string]config.Service{"echo": {Addr: public, TokenHash: configHash(token)}}, Transport: config.ServerTransport{Type: "noise", PrivateKey: sk.Private, PeerKey: ck.Public}, Pool: config.ServerPool{MaxConnections: 1, MaxPending: 4, AcquireTimeout: time.Second}}
-	clicfg := &config.Client{RemoteAddr: tunnel, DialTimeout: time.Second, Services: map[string]config.Service{"echo": {Addr: backend.Addr().String(), Token: token}}, Transport: config.ClientTransport{Type: "noise", PrivateKey: ck.Private, PeerKey: sk.Public, RemoteAddr: tunnel, DialTimeout: time.Second}, Pool: config.ClientPool{Size: 1}}
+	srvcfg := &config.Server{BindAddr: tunnel, Services: map[string]config.Service{"echo": {Addr: public, TokenHash: configHash(token)}}, Transport: config.ServerTransport{Type: "noise", PrivateKey: sk.Private, PeerKey: ck.Public}, Pool: config.ServerPool{MaxPending: 4, AcquireTimeout: time.Second}}
+	clicfg := &config.Client{RemoteAddr: tunnel, DialTimeout: time.Second, Services: map[string]config.Service{"echo": {Addr: backend.Addr().String(), Token: token}}, Transport: config.ClientTransport{Type: "noise", PrivateKey: ck.Private, PeerKey: sk.Public, RemoteAddr: tunnel, DialTimeout: time.Second}, Pool: config.ClientPool{MinIdle: 1, MaxIdle: 1, Heartbeat: 15 * time.Second, IdleTimeout: time.Minute, MaxLifetime: time.Hour}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	results := make(chan error, 2)

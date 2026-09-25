@@ -37,7 +37,7 @@ func Run(ctx context.Context, cfg *config.Server) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	r := &runtime{cfg: cfg, pools: make(map[string]*pool.Pool, len(listeners)), log: log}
 	for name := range listeners {
-		r.pools[name] = pool.New(cfg.Pool.MaxConnections, cfg.Pool.MaxPending)
+		r.pools[name] = pool.New(cfg.Pool.MaxPending)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

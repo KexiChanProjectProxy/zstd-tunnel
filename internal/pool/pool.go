@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -21,8 +22,31 @@ const (
 	leased
 	releasing
 	checking
+	expiring
 	closed
 )
+
+// Outcome tells a worker goroutine what to do next.
+type Outcome uint8
+
+const (
+	// Ready: the worker is in the idle list and can wait in Next.
+	Ready Outcome = iota
+	// Leased: Next returned a public TCP connection to serve.
+	Leased
+	// Check: the worker was taken out of the idle list for a heartbeat.
+	Check
+	// Expired: the worker hit its idle or lifetime deadline and must close.
+	Expired
+	// Stopped: the pool is stopping or the worker was closed.
+	Stopped
+)
+
+// Options are the per-connection timings. A zero Heartbeat, IdleTimeout or
+// MaxLifetime disables that timer.
+type Options struct {
+	Heartbeat, IdleTimeout, IdleJitter, MaxLifetime, LifetimeJitter time.Duration
+}
 
 type waiter struct {
 	tcp      *net.TCPConn
@@ -40,33 +64,79 @@ type Worker struct {
 	business  *net.TCPConn
 	wake      chan struct{}
 	closeConn func()
+	opts      Options
+	dies      time.Time
+	expires   time.Time
+	elem      *list.Element
 	ID        uint64
 }
 type Pool struct {
-	mu              sync.Mutex
-	max, pendingMax int
-	stopping        bool
-	workers         map[*Worker]struct{}
-	idle            list.List
-	waiting         list.List
-	pending         int
+	mu         sync.Mutex
+	pendingMax int
+	stopping   bool
+	workers    map[*Worker]struct{}
+	idle       list.List // ordered by ascending Worker.ID; Back is the newest
+	waiting    list.List
+	pending    int
 }
 
-func New(maxConnections, maxPending int) *Pool {
-	return &Pool{max: maxConnections, pendingMax: maxPending, workers: make(map[*Worker]struct{})}
+func New(maxPending int) *Pool {
+	return &Pool{pendingMax: maxPending, workers: make(map[*Worker]struct{})}
 }
-func (p *Pool) Register(id uint64, closeConn func()) (*Worker, error) {
+
+// never is far enough in the future to stand for a disabled deadline.
+var never = time.Unix(1<<62, 0)
+
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d) + 1))
+}
+func after(now time.Time, base, spread time.Duration) time.Time {
+	if base <= 0 {
+		return never
+	}
+	return now.Add(base + jitter(spread))
+}
+func earlier(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func (p *Pool) Register(id uint64, opts Options, closeConn func()) (*Worker, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.stopping {
 		return nil, ErrStopped
 	}
-	if len(p.workers) >= p.max {
-		return nil, ErrFull
-	}
-	w := &Worker{p: p, state: registering, wake: make(chan struct{}, 1), closeConn: closeConn, ID: id}
+	w := &Worker{p: p, state: registering, wake: make(chan struct{}, 1), closeConn: closeConn, opts: opts, ID: id}
+	w.dies = after(time.Now(), opts.MaxLifetime, opts.LifetimeJitter)
 	p.workers[w] = struct{}{}
 	return w, nil
+}
+func (p *Pool) unlinkLocked(w *Worker) {
+	if w.elem != nil {
+		p.idle.Remove(w.elem)
+		w.elem = nil
+	}
+}
+
+// pushIdleLocked keeps the idle list ordered by connection ID so that
+// Dispatch can always pick the most recently established connection.
+func (p *Pool) pushIdleLocked(w *Worker) {
+	e := p.idle.Back()
+	for e != nil && e.Value.(*Worker).ID > w.ID {
+		e = e.Prev()
+	}
+	if e == nil {
+		w.elem = p.idle.PushFront(w)
+	} else {
+		w.elem = p.idle.InsertAfter(w, e)
+	}
+	w.state = idle
 }
 func (w *Worker) Closed() {
 	p := w.p
@@ -77,12 +147,7 @@ func (w *Worker) Closed() {
 	}
 	w.state = closed
 	delete(p.workers, w)
-	for e := p.idle.Front(); e != nil; e = e.Next() {
-		if e.Value == w {
-			p.idle.Remove(e)
-			break
-		}
-	}
+	p.unlinkLocked(w)
 	tcp := w.mailbox
 	w.mailbox = nil
 	business := w.business
@@ -121,8 +186,7 @@ func (p *Pool) matchLocked(w *Worker) []*net.TCPConn {
 		w.notify()
 		return expired
 	}
-	p.idle.PushBack(w)
-	w.state = idle
+	p.pushIdleLocked(w)
 	return expired
 }
 func (p *Pool) removeLocked(v *waiter) {
@@ -139,21 +203,36 @@ func (p *Pool) removeLocked(v *waiter) {
 		v.timer.Stop()
 	}
 }
-func (w *Worker) Idle() bool {
+
+// Idle returns the worker to service after registration, a lease or a
+// heartbeat check. It reports Expired when the connection has outlived
+// MaxLifetime; the caller must then close it. The idle deadline restarts
+// only when the worker comes back from registration or a lease, never after
+// a heartbeat, so heartbeats do not keep an unused connection alive.
+func (w *Worker) Idle() Outcome {
 	p := w.p
 	p.mu.Lock()
 	if p.stopping || w.state == closed {
 		p.mu.Unlock()
 		w.Closed()
-		return false
+		return Stopped
 	}
 	w.business = nil
+	now := time.Now()
+	if !now.Before(w.dies) {
+		w.state = expiring
+		p.mu.Unlock()
+		return Expired
+	}
+	if w.state != checking {
+		w.expires = after(now, w.opts.IdleTimeout, w.opts.IdleJitter)
+	}
 	expired := p.matchLocked(w)
 	p.mu.Unlock()
 	for _, tcp := range expired {
 		_ = tcp.Close()
 	}
-	return true
+	return Ready
 }
 func (w *Worker) Releasing() {
 	p := w.p
@@ -180,9 +259,8 @@ func (p *Pool) Dispatch(ctx context.Context, tcp *net.TCPConn, deadline time.Tim
 		return err
 	}
 	if p.waiting.Len() == 0 && p.idle.Len() > 0 {
-		e := p.idle.Front()
-		w := e.Value.(*Worker)
-		p.idle.Remove(e)
+		w := p.idle.Back().Value.(*Worker)
+		p.unlinkLocked(w)
 		w.state = leased
 		w.mailbox = tcp
 		w.business = tcp
@@ -213,43 +291,79 @@ func (p *Pool) Dispatch(ctx context.Context, tcp *net.TCPConn, deadline time.Tim
 	p.mu.Unlock()
 	return nil
 }
-func (w *Worker) Next(ctx context.Context) (*net.TCPConn, bool) {
-	timer := time.NewTimer(15 * time.Second)
-	defer timer.Stop()
+
+// timer returns a timer channel firing after d, or nil (never fires) when
+// the deadline is disabled.
+func timer(d time.Duration, disabled bool) (*time.Timer, <-chan time.Time) {
+	if disabled {
+		return nil, nil
+	}
+	t := time.NewTimer(d)
+	return t, t.C
+}
+
+// takeIdleLocked moves an idle worker into state s, reporting whether it was
+// idle. Only idle workers can be taken, so this never races with Dispatch.
+func (p *Pool) takeIdleLocked(w *Worker, s state) bool {
+	if w.state != idle || p.stopping {
+		return false
+	}
+	p.unlinkLocked(w)
+	w.state = s
+	return true
+}
+
+// Next waits for a lease, a heartbeat check or the idle/lifetime deadline.
+func (w *Worker) Next(ctx context.Context) (*net.TCPConn, Outcome) {
+	p := w.p
+	p.mu.Lock()
+	deadline := earlier(w.expires, w.dies)
+	p.mu.Unlock()
+	if deadline.IsZero() {
+		deadline = never
+	}
+	hb, hbC := timer(w.opts.Heartbeat, w.opts.Heartbeat <= 0)
+	if hb != nil {
+		defer hb.Stop()
+	}
+	ex, exC := timer(time.Until(deadline), deadline.Equal(never))
+	if ex != nil {
+		defer ex.Stop()
+	}
 	for {
-		p := w.p
 		p.mu.Lock()
 		if w.state == closed || p.stopping && w.state == idle {
 			p.mu.Unlock()
-			return nil, false
+			return nil, Stopped
 		}
 		if w.mailbox != nil {
 			tcp := w.mailbox
 			w.mailbox = nil
 			p.mu.Unlock()
-			return tcp, false
+			return tcp, Leased
 		}
 		p.mu.Unlock()
 		select {
 		case <-w.wake:
-			continue
-		case <-timer.C:
+		case <-hbC:
 			p.mu.Lock()
-			if w.state == idle && !p.stopping {
-				for e := p.idle.Front(); e != nil; e = e.Next() {
-					if e.Value == w {
-						p.idle.Remove(e)
-						break
-					}
-				}
-				w.state = checking
-				p.mu.Unlock()
-				return nil, true
-			}
+			ok := p.takeIdleLocked(w, checking)
 			p.mu.Unlock()
-			timer.Reset(15 * time.Second)
+			if ok {
+				return nil, Check
+			}
+			hb.Reset(w.opts.Heartbeat)
+		case <-exC:
+			// If the worker is no longer idle it was leased (the mailbox
+			// is set and wake is pending) or closed; the loop handles both.
+			p.mu.Lock()
+			ok := p.takeIdleLocked(w, expiring)
+			p.mu.Unlock()
+			if ok {
+				return nil, Expired
+			}
 		case <-ctx.Done():
-			return nil, false
+			return nil, Stopped
 		}
 	}
 }
@@ -270,7 +384,8 @@ func (p *Pool) Stop() {
 		e = next
 	}
 	for w := range p.workers {
-		if w.state == idle || w.state == checking || w.state == registering {
+		switch w.state {
+		case idle, checking, registering, expiring:
 			toClose = append(toClose, w)
 		}
 	}

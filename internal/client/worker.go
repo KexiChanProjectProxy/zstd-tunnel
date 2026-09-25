@@ -16,10 +16,41 @@ import (
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/transport"
 )
 
+const (
+	baseBackoff = 250 * time.Millisecond
+	maxBackoff  = 30 * time.Second
+	stableAfter = 30 * time.Second
+)
+
+// errSurplus reports that a connection was closed at the release barrier
+// because the service already had max_idle idle connections.
+var errSurplus = errors.New("surplus idle connection")
+
+type slotState uint8
+
+const (
+	connecting slotState = iota
+	idleSlot
+	busySlot
+)
+
+// service tracks one configured service's tunnel connections. The counters
+// are guarded by runtime.mu. idle+connecting never exceeds MaxIdle: new
+// dials only happen while it is below MinIdle, and a connection only
+// returns to idle at a release barrier while it is below MaxIdle.
+type service struct {
+	name             string
+	cfg              config.Service
+	wake             chan struct{}
+	idle, connecting int
+	backoff          time.Duration
+	notBefore        time.Time
+}
 type slot struct {
-	conn *protocol.Conn
-	tcp  *net.TCPConn
-	busy bool
+	conn  *protocol.Conn
+	tcp   *net.TCPConn
+	state slotState
+	svc   *service
 }
 type runtime struct {
 	cfg      *config.Client
@@ -30,56 +61,104 @@ type runtime struct {
 	wg       sync.WaitGroup
 }
 
-func (r *runtime) runSlot(ctx context.Context, service string, cfg config.Service) {
+func (svc *service) notify() {
+	select {
+	case svc.wake <- struct{}{}:
+	default:
+	}
+}
+
+// control keeps at least MinIdle idle-or-connecting tunnel connections open
+// for one service, honouring the reconnect backoff after failures.
+func (r *runtime) control(ctx context.Context, svc *service) {
 	defer r.wg.Done()
-	s := &slot{}
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	for {
+		r.mu.Lock()
+		if r.stopping || ctx.Err() != nil {
+			r.mu.Unlock()
+			return
+		}
+		if need := r.cfg.Pool.MinIdle - svc.idle - svc.connecting; need > 0 {
+			if wait := time.Until(svc.notBefore); wait > 0 {
+				timer.Reset(wait)
+			} else {
+				svc.connecting += need
+				r.wg.Add(need)
+				for range need {
+					go r.runConn(ctx, svc)
+				}
+			}
+		}
+		r.mu.Unlock()
+		select {
+		case <-svc.wake:
+		case <-timer.C:
+		case <-ctx.Done():
+			return
+		}
+		timer.Stop()
+	}
+}
+
+// runConn owns one tunnel connection from dial to close. Connections are
+// never redialled in place; the controller decides whether to replace them.
+func (r *runtime) runConn(ctx context.Context, svc *service) {
+	defer r.wg.Done()
+	s := &slot{state: connecting, svc: svc}
 	r.mu.Lock()
 	r.slots[s] = struct{}{}
 	r.mu.Unlock()
-	defer func() { r.drop(s); r.mu.Lock(); delete(r.slots, s); r.mu.Unlock() }()
-	backoff := 250 * time.Millisecond
-	for ctx.Err() == nil {
-		raw, e := transport.Dial(ctx, r.cfg.Transport)
-		if e == nil {
-			c := protocol.NewConn(raw)
-			r.mu.Lock()
-			if r.stopping {
-				r.mu.Unlock()
-				_ = c.Close()
-				return
-			}
-			s.conn = c
-			r.mu.Unlock()
-			started := time.Now()
-			e = r.serveSlot(ctx, s, c, service, cfg)
-			r.drop(s)
-			if ctx.Err() != nil {
-				return
-			}
-			if time.Since(started) >= 30*time.Second {
-				backoff = 250 * time.Millisecond
-			}
-		}
-		if e != nil {
-			r.log.Warn("client connection failed", "event", "connection_closed", "service", service, "error", e.Error())
-		}
-		jitter := time.Duration(rand.Int64N(int64(backoff) + 1))
-		timer := time.NewTimer(jitter)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-		backoff = min(backoff*2, 30*time.Second)
+	started := time.Now()
+	e := r.dialAndServe(ctx, s)
+	r.drop(s)
+	r.mu.Lock()
+	delete(r.slots, s)
+	switch s.state {
+	case connecting:
+		svc.connecting--
+	case idleSlot:
+		svc.idle--
 	}
+	failed := e != nil && ctx.Err() == nil && !r.stopping
+	if failed {
+		if time.Since(started) >= stableAfter {
+			svc.backoff = baseBackoff
+		}
+		svc.notBefore = time.Now().Add(time.Duration(rand.Int64N(int64(svc.backoff) + 1)))
+		svc.backoff = min(svc.backoff*2, maxBackoff)
+	} else if e == nil {
+		svc.backoff = baseBackoff
+	}
+	r.mu.Unlock()
+	if failed {
+		r.log.Warn("client connection failed", "event", "connection_closed", "service", svc.name, "error", e.Error())
+	}
+	svc.notify()
+}
+func (r *runtime) dialAndServe(ctx context.Context, s *slot) error {
+	raw, e := transport.Dial(ctx, r.cfg.Transport)
+	if e != nil {
+		return e
+	}
+	c := protocol.NewConn(raw)
+	r.mu.Lock()
+	if r.stopping {
+		r.mu.Unlock()
+		_ = c.Close()
+		return nil
+	}
+	s.conn = c
+	r.mu.Unlock()
+	return r.serveSlot(ctx, s, c)
 }
 func (r *runtime) drop(s *slot) {
 	r.mu.Lock()
 	conn, tcp := s.conn, s.tcp
 	s.conn = nil
 	s.tcp = nil
-	s.busy = false
 	r.mu.Unlock()
 	if tcp != nil {
 		_ = tcp.Close()
@@ -88,15 +167,18 @@ func (r *runtime) drop(s *slot) {
 		_ = conn.Close()
 	}
 }
-func (r *runtime) setBusy(s *slot, tcp *net.TCPConn, busy bool) {
+func (r *runtime) setTCP(s *slot, tcp *net.TCPConn) {
 	r.mu.Lock()
 	s.tcp = tcp
-	s.busy = busy
 	r.mu.Unlock()
 }
-func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn, service string, cfg config.Service) error {
+func poolParams(p config.ClientPool) protocol.PoolParams {
+	return protocol.PoolParams{HeartbeatMS: p.Heartbeat.Milliseconds(), IdleTimeoutMS: p.IdleTimeout.Milliseconds(), IdleJitterMS: p.IdleJitter.Milliseconds(), MaxLifetimeMS: p.MaxLifetime.Milliseconds(), LifetimeJitterMS: p.LifetimeJitter.Milliseconds()}
+}
+func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn) error {
+	svc := s.svc
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	if e := c.WriteFrame(protocol.Frame{Type: protocol.HELLO, Payload: protocol.JSON(protocol.Hello{Version: 1, Service: service, Token: cfg.Token, Compression: "zstd"})}); e != nil {
+	if e := c.WriteFrame(protocol.Frame{Type: protocol.HELLO, Payload: protocol.JSON(protocol.Hello{Version: 2, Service: svc.name, Token: svc.cfg.Token, Compression: "zstd", Pool: poolParams(r.cfg.Pool)})}); e != nil {
 		return e
 	}
 	f, e := c.ReadFrame()
@@ -116,6 +198,11 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn, serv
 	if f.Type != protocol.HELLO_OK {
 		return errors.New("invalid HELLO reply")
 	}
+	r.mu.Lock()
+	s.state = idleSlot
+	svc.connecting--
+	svc.idle++
+	r.mu.Unlock()
 	if e = c.WriteFrame(protocol.Frame{Type: protocol.READY}); e != nil {
 		return e
 	}
@@ -123,11 +210,12 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn, serv
 	var codec relay.Relay
 	defer codec.Close()
 	var last uint64
+	idleRead := 3 * r.cfg.Pool.Heartbeat
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(idleRead))
 		f, e = c.ReadFrame()
 		if e != nil {
 			return e
@@ -144,19 +232,29 @@ func (r *runtime) serveSlot(ctx context.Context, s *slot, c *protocol.Conn, serv
 			if e != nil {
 				return e
 			}
+		case protocol.CLOSE:
+			if f.LeaseID != 0 {
+				return errors.New("wrong CLOSE id")
+			}
+			r.log.Info("connection retired", "event", "connection_retired", "service", svc.name, "reason", "server_close")
+			return nil
 		case protocol.OPEN:
 			if last == math.MaxUint64 || f.LeaseID != last+1 {
 				return errors.New("nonmonotonic OPEN")
 			}
 			last = f.LeaseID
-			r.setBusy(s, nil, true)
-			e = r.lease(c, s, cfg, &codec, last)
-			r.setBusy(s, nil, false)
+			r.mu.Lock()
+			s.state = busySlot
+			svc.idle--
+			r.mu.Unlock()
+			svc.notify()
+			e = r.lease(c, s, svc.cfg, &codec, last)
+			if errors.Is(e, errSurplus) {
+				r.log.Info("connection retired", "event", "connection_retired", "service", svc.name, "reason", "surplus")
+				return nil
+			}
 			if e != nil {
 				return e
-			}
-			if ctx.Err() != nil {
-				return nil
 			}
 		default:
 			return errors.New("unexpected idle frame")
@@ -175,8 +273,8 @@ func (r *runtime) lease(c *protocol.Conn, s *slot, cfg config.Service, codec *re
 		}
 	} else {
 		tcp := raw.(*net.TCPConn)
-		r.setBusy(s, tcp, true)
-		defer tcp.Close()
+		r.setTCP(s, tcp)
+		defer func() { r.setTCP(s, nil); _ = tcp.Close() }()
 		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if e = c.WriteFrame(protocol.Frame{Type: protocol.OPEN_OK, LeaseID: id}); e != nil {
 			return e
@@ -194,6 +292,22 @@ func (r *runtime) lease(c *protocol.Conn, s *slot, cfg config.Service, codec *re
 	if f.Type != protocol.RELEASE || f.LeaseID != id {
 		return errors.New("invalid RELEASE")
 	}
+	// The server keeps this connection out of its idle list until it sees
+	// READY, so deciding here cannot race with a new OPEN.
+	r.mu.Lock()
+	svc := s.svc
+	surplus := r.stopping || svc.idle+svc.connecting >= r.cfg.Pool.MaxIdle
+	if !surplus {
+		s.state = idleSlot
+		svc.idle++
+	}
+	r.mu.Unlock()
+	if surplus {
+		if e = c.WriteFrame(protocol.Frame{Type: protocol.CLOSE}); e != nil {
+			return e
+		}
+		return errSurplus
+	}
 	if e = c.WriteFrame(protocol.Frame{Type: protocol.READY, LeaseID: id}); e != nil {
 		return e
 	}
@@ -205,7 +319,7 @@ func (r *runtime) stop() {
 	r.stopping = true
 	var idle []*protocol.Conn
 	for s := range r.slots {
-		if !s.busy && s.conn != nil {
+		if s.state != busySlot && s.conn != nil {
 			idle = append(idle, s.conn)
 		}
 	}

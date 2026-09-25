@@ -24,15 +24,12 @@ func pair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return c.(*net.TCPConn), <-accepted
 }
 func TestSerialQueueAndExpiry(t *testing.T) {
-	p := New(1, 1)
-	w, e := p.Register(1, func() {})
+	p := New(1)
+	w, e := p.Register(1, Options{}, func() {})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = p.Register(2, func() {}); e != ErrFull {
-		t.Fatal("registration cap")
-	}
-	if !w.Idle() {
+	if w.Idle() != Ready {
 		t.Fatal("idle failed")
 	}
 	a, b := pair(t)
@@ -58,7 +55,7 @@ func TestSerialQueueAndExpiry(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 	w.Releasing()
-	if !w.Idle() {
+	if w.Idle() != Ready {
 		t.Fatal("return failed")
 	}
 	p.mu.Lock()
@@ -78,8 +75,8 @@ func TestSerialQueueAndExpiry(t *testing.T) {
 	}
 }
 func TestCancelAfterHandoffDoesNotCloseTCP(t *testing.T) {
-	p := New(1, 1)
-	w, _ := p.Register(1, func() {})
+	p := New(1)
+	w, _ := p.Register(1, Options{}, func() {})
 	ctx, cancel := context.WithCancel(context.Background())
 	a, b := pair(t)
 	defer a.Close()
@@ -102,8 +99,8 @@ func TestCancelAfterHandoffDoesNotCloseTCP(t *testing.T) {
 }
 
 func TestDeadlineCheckedBeforeTimerCallback(t *testing.T) {
-	p := New(1, 2)
-	w, _ := p.Register(1, func() {})
+	p := New(2)
+	w, _ := p.Register(1, Options{}, func() {})
 	a, b := pair(t)
 	defer a.Close()
 	defer b.Close()
@@ -114,7 +111,7 @@ func TestDeadlineCheckedBeforeTimerCallback(t *testing.T) {
 	v := p.waiting.Front().Value.(*waiter)
 	v.deadline = time.Now().Add(-time.Second)
 	p.mu.Unlock()
-	if !w.Idle() {
+	if w.Idle() != Ready {
 		t.Fatal("idle failed")
 	}
 	p.mu.Lock()
@@ -132,11 +129,11 @@ func TestDeadlineCheckedBeforeTimerCallback(t *testing.T) {
 }
 
 func TestCheckingCannotLeaseUntilPong(t *testing.T) {
-	p := New(1, 2)
-	w, _ := p.Register(1, func() {})
+	p := New(2)
+	w, _ := p.Register(1, Options{}, func() {})
 	w.Idle()
 	p.mu.Lock()
-	p.idle.Remove(p.idle.Front())
+	p.unlinkLocked(w)
 	w.state = checking
 	p.mu.Unlock()
 	a, b := pair(t)
@@ -160,8 +157,8 @@ func TestCheckingCannotLeaseUntilPong(t *testing.T) {
 }
 
 func TestWaitingCancellationPreservesWorker(t *testing.T) {
-	p := New(1, 1)
-	w, _ := p.Register(1, func() {})
+	p := New(1)
+	w, _ := p.Register(1, Options{}, func() {})
 	visitor, waiting := pair(t)
 	defer visitor.Close()
 	defer waiting.Close()
@@ -175,7 +172,7 @@ func TestWaitingCancellationPreservesWorker(t *testing.T) {
 	if _, e := visitor.Read(one[:]); e != io.EOF {
 		t.Fatalf("waiting TCP not closed: %v", e)
 	}
-	if !w.Idle() {
+	if w.Idle() != Ready {
 		t.Fatal("cancel poisoned healthy worker")
 	}
 	active, handed := pair(t)
@@ -192,19 +189,19 @@ func TestWaitingCancellationPreservesWorker(t *testing.T) {
 }
 
 func TestStopNeverReturnsCheckingOrReleasingToIdle(t *testing.T) {
-	pChecking := New(1, 1)
-	w, _ := pChecking.Register(1, func() {})
+	pChecking := New(1)
+	w, _ := pChecking.Register(1, Options{}, func() {})
 	w.Idle()
 	pChecking.mu.Lock()
-	pChecking.idle.Remove(pChecking.idle.Front())
+	pChecking.unlinkLocked(w)
 	w.state = checking
 	pChecking.mu.Unlock()
 	pChecking.Stop()
-	if w.Idle() || pChecking.Count() != 0 {
+	if w.Idle() != Stopped || pChecking.Count() != 0 {
 		t.Fatal("late PONG restored stopped worker")
 	}
-	releasing := New(1, 1)
-	v, _ := releasing.Register(1, func() {})
+	releasing := New(1)
+	v, _ := releasing.Register(1, Options{}, func() {})
 	v.Idle()
 	visitor, accepted := pair(t)
 	defer visitor.Close()
@@ -218,7 +215,7 @@ func TestStopNeverReturnsCheckingOrReleasingToIdle(t *testing.T) {
 	if releasing.Count() != 1 {
 		t.Fatal("active release closed before barrier")
 	}
-	if v.Idle() || releasing.Count() != 0 {
+	if v.Idle() != Stopped || releasing.Count() != 0 {
 		t.Fatal("late READY restored stopped worker")
 	}
 }

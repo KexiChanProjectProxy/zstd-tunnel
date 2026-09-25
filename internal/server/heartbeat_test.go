@@ -15,17 +15,21 @@ import (
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/transport"
 )
 
-func TestBadPongReleasesConnectionQuota(t *testing.T) {
+const heartbeatToken = "heartbeat-test-token-with-enough-length"
+
+// startRawServer runs a server and returns a function that registers a
+// hand-driven tunnel connection announcing the given pool timings.
+func startRawServer(t *testing.T) func(protocol.PoolParams) (*protocol.Conn, error) {
+	t.Helper()
 	serverKey, _ := noise.DH25519.GenerateKeypair(rand.Reader)
 	clientKey, _ := noise.DH25519.GenerateKeypair(rand.Reader)
-	token := "heartbeat-test-token-with-enough-length"
 	tunnel := freePort(t)
-	cfg := &config.Server{BindAddr: tunnel, Services: map[string]config.Service{"heartbeat": {Addr: freePort(t), TokenHash: sha256.Sum256([]byte(token))}}, Transport: config.ServerTransport{Type: "noise", PrivateKey: serverKey.Private, PeerKey: clientKey.Public}, Pool: config.ServerPool{MaxConnections: 1, MaxPending: 1, AcquireTimeout: time.Second}}
+	cfg := &config.Server{BindAddr: tunnel, Services: map[string]config.Service{"heartbeat": {Addr: freePort(t), TokenHash: sha256.Sum256([]byte(heartbeatToken))}}, Transport: config.ServerTransport{Type: "noise", PrivateKey: serverKey.Private, PeerKey: clientKey.Public}, Pool: config.ServerPool{MaxPending: 1, AcquireTimeout: time.Second}}
 	clientCfg := config.ClientTransport{Type: "noise", PrivateKey: clientKey.Private, PeerKey: serverKey.Public, RemoteAddr: tunnel, DialTimeout: time.Second}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- server.Run(ctx, cfg) }()
-	defer func() {
+	t.Cleanup(func() {
 		cancel()
 		select {
 		case e := <-done:
@@ -35,8 +39,8 @@ func TestBadPongReleasesConnectionQuota(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Error("server shutdown stuck")
 		}
-	}()
-	connect := func() (*protocol.Conn, error) {
+	})
+	return func(params protocol.PoolParams) (*protocol.Conn, error) {
 		var e error
 		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
 			raw, err := transport.Dial(ctx, clientCfg)
@@ -47,7 +51,7 @@ func TestBadPongReleasesConnectionQuota(t *testing.T) {
 			}
 			conn := protocol.NewConn(raw)
 			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-			err = conn.WriteFrame(protocol.Frame{Type: protocol.HELLO, Payload: protocol.JSON(protocol.Hello{Version: 1, Service: "heartbeat", Token: token, Compression: "zstd"})})
+			err = conn.WriteFrame(protocol.Frame{Type: protocol.HELLO, Payload: protocol.JSON(protocol.Hello{Version: 2, Service: "heartbeat", Token: heartbeatToken, Compression: "zstd", Pool: params})})
 			if err == nil {
 				var frame protocol.Frame
 				frame, err = conn.ReadFrame()
@@ -68,12 +72,18 @@ func TestBadPongReleasesConnectionQuota(t *testing.T) {
 		}
 		return nil, e
 	}
-	first, e := connect()
+}
+
+var fastHeartbeat = protocol.PoolParams{HeartbeatMS: 1000, IdleTimeoutMS: 60000, MaxLifetimeMS: 3600000}
+
+func TestHeartbeatFailuresCloseConnection(t *testing.T) {
+	connect := startRawServer(t)
+	first, e := connect(fastHeartbeat)
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer first.Close()
-	_ = first.SetReadDeadline(time.Now().Add(20 * time.Second))
+	_ = first.SetReadDeadline(time.Now().Add(3 * time.Second))
 	ping, e := first.ReadFrame()
 	if e != nil || ping.Type != protocol.PING || ping.LeaseID != 0 || len(ping.Payload) != 8 {
 		t.Fatalf("idle heartbeat: %+v %v", ping, e)
@@ -86,12 +96,12 @@ func TestBadPongReleasesConnectionQuota(t *testing.T) {
 	if _, e = first.ReadFrame(); e == nil {
 		t.Fatal("invalid PONG kept connection alive")
 	}
-	second, e := connect()
+	second, e := connect(fastHeartbeat)
 	if e != nil {
-		t.Fatal("quota was not released", e)
+		t.Fatal(e)
 	}
 	defer second.Close()
-	_ = second.SetReadDeadline(time.Now().Add(20 * time.Second))
+	_ = second.SetReadDeadline(time.Now().Add(3 * time.Second))
 	ping, e = second.ReadFrame()
 	if e != nil || ping.Type != protocol.PING {
 		t.Fatalf("second heartbeat: %+v %v", ping, e)
@@ -100,9 +110,49 @@ func TestBadPongReleasesConnectionQuota(t *testing.T) {
 	if _, e = second.ReadFrame(); e == nil {
 		t.Fatal("missing PONG kept connection alive")
 	}
-	third, e := connect()
-	if e != nil {
-		t.Fatal("timeout did not free quota", e)
+}
+
+func TestInvalidPoolRejected(t *testing.T) {
+	connect := startRawServer(t)
+	if c, e := connect(protocol.PoolParams{HeartbeatMS: 10, IdleTimeoutMS: 60000, MaxLifetimeMS: 3600000}); e == nil {
+		_ = c.Close()
+		t.Fatal("sub-second heartbeat accepted")
 	}
-	_ = third.Close()
+}
+
+// Heartbeats must not refresh the idle deadline, and an expiring connection
+// announces CLOSE before the server hangs up.
+func TestIdleExpirySendsClose(t *testing.T) {
+	connect := startRawServer(t)
+	c, e := connect(protocol.PoolParams{HeartbeatMS: 1000, IdleTimeoutMS: 2500, MaxLifetimeMS: 3600000})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close()
+	start := time.Now()
+	pings := 0
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		f, e := c.ReadFrame()
+		if e != nil {
+			t.Fatalf("after %d pings: %v", pings, e)
+		}
+		if f.Type == protocol.CLOSE {
+			break
+		}
+		if f.Type != protocol.PING {
+			t.Fatalf("unexpected frame %d", f.Type)
+		}
+		pings++
+		if e = c.WriteFrame(protocol.Frame{Type: protocol.PONG, Payload: f.Payload}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if d := time.Since(start); d < 2400*time.Millisecond || d > 4*time.Second || pings < 2 {
+		t.Fatalf("CLOSE after %v and %d pings", d, pings)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, e = c.ReadFrame(); e == nil {
+		t.Fatal("connection open after CLOSE")
+	}
 }

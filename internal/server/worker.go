@@ -51,7 +51,7 @@ func (r *runtime) register(in *transport.Incoming) {
 	}
 	given := sha256.Sum256([]byte(hello.Token))
 	valid := subtle.ConstantTimeCompare(expected[:], given[:]) == 1
-	if hello.Version != 1 || hello.Compression != "zstd" {
+	if hello.Version != 2 || hello.Compression != "zstd" {
 		r.reject(conn, id, "incompatible_protocol")
 		return
 	}
@@ -59,10 +59,15 @@ func (r *runtime) register(in *transport.Incoming) {
 		r.reject(conn, id, "authentication_failed")
 		return
 	}
-	p := r.pools[hello.Service]
-	w, e := p.Register(id, func() { _ = conn.Close() })
+	opts, e := poolOptions(hello.Pool)
 	if e != nil {
-		r.reject(conn, id, "pool_full")
+		r.reject(conn, id, "invalid_pool")
+		return
+	}
+	p := r.pools[hello.Service]
+	w, e := p.Register(id, opts, func() { _ = conn.Close() })
+	if e != nil {
+		r.reject(conn, id, "shutting_down")
 		return
 	}
 	if e = conn.WriteFrame(protocol.Frame{Type: protocol.HELLO_OK}); e != nil {
@@ -87,50 +92,90 @@ func (r *runtime) reject(c *protocol.Conn, id uint64, code string) {
 	_ = c.WriteFrame(protocol.Frame{Type: protocol.HELLO_ERR, Payload: protocol.JSON(protocol.Code{Code: code})})
 	_ = c.Close()
 }
-func (r *runtime) ready(w *pool.Worker, service string) bool {
-	if !w.Idle() {
-		return false
+
+// errClientClose reports that the client closed a surplus idle connection at
+// the release barrier instead of returning it to the pool.
+var errClientClose = errors.New("client closed connection at release")
+
+// poolOptions validates the timings a client announced in HELLO.
+func poolOptions(p protocol.PoolParams) (pool.Options, error) {
+	ms := func(v int64) time.Duration {
+		if v < 0 || v > 1<<40 {
+			return -1
+		}
+		return time.Duration(v) * time.Millisecond
 	}
-	r.log.Info("connection ready", "event", "pool_ready", "service", service, "connection_id", w.ID)
-	return true
+	c := config.ClientPool{MinIdle: 1, MaxIdle: 1, Heartbeat: ms(p.HeartbeatMS), IdleTimeout: ms(p.IdleTimeoutMS), IdleJitter: ms(p.IdleJitterMS), MaxLifetime: ms(p.MaxLifetimeMS), LifetimeJitter: ms(p.LifetimeJitterMS)}
+	if e := config.ValidatePool(c); e != nil {
+		return pool.Options{}, e
+	}
+	return pool.Options{Heartbeat: c.Heartbeat, IdleTimeout: c.IdleTimeout, IdleJitter: c.IdleJitter, MaxLifetime: c.MaxLifetime, LifetimeJitter: c.LifetimeJitter}, nil
 }
+
+// goodbye tells the client that an idle connection is being retired so it
+// can replace it without treating the close as a failure.
+func goodbye(conn *protocol.Conn) {
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.WriteFrame(protocol.Frame{Type: protocol.CLOSE})
+}
+
+func heartbeat(conn *protocol.Conn) error {
+	var nonce [8]byte
+	if _, e := rand.Read(nonce[:]); e != nil {
+		return e
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if e := conn.WriteFrame(protocol.Frame{Type: protocol.PING, Payload: nonce[:]}); e != nil {
+		return e
+	}
+	f, e := conn.ReadFrame()
+	if e != nil {
+		return e
+	}
+	if f.Type != protocol.PONG || f.LeaseID != 0 || subtle.ConstantTimeCompare(f.Payload, nonce[:]) != 1 {
+		return errors.New("invalid PONG")
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return nil
+}
+
 func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
+	reason := "error"
 	defer func() {
 		w.Closed()
-		r.log.Info("connection closed", "event", "connection_closed", "service", service, "connection_id", w.ID)
+		r.log.Info("connection closed", "event", "connection_closed", "service", service, "connection_id", w.ID, "reason", reason)
 	}()
 	var codec relay.Relay
 	defer codec.Close()
-	if !r.ready(w, service) {
-		return
-	}
 	var last uint64
+	outcome := w.Idle()
 	for {
-		tcp, check := w.Next(context.Background())
-		if check {
-			var nonce [8]byte
-			if _, e := rand.Read(nonce[:]); e != nil {
-				return
-			}
-			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			e := conn.WriteFrame(protocol.Frame{Type: protocol.PING, Payload: nonce[:]})
-			if e == nil {
-				var f protocol.Frame
-				f, e = conn.ReadFrame()
-				if e == nil && (f.Type != protocol.PONG || f.LeaseID != 0 || subtle.ConstantTimeCompare(f.Payload, nonce[:]) != 1) {
-					e = errors.New("invalid PONG")
-				}
-			}
-			if e != nil {
-				return
-			}
-			_ = conn.SetDeadline(time.Time{})
-			if !r.ready(w, service) {
-				return
-			}
-			continue
+		switch outcome {
+		case pool.Ready:
+			r.log.Info("connection ready", "event", "pool_ready", "service", service, "connection_id", w.ID)
+		case pool.Expired:
+			reason = "expired"
+			goodbye(conn)
+			return
+		default:
+			reason = "shutdown"
+			return
 		}
-		if tcp == nil {
+		tcp, next := w.Next(context.Background())
+		switch next {
+		case pool.Check:
+			if heartbeat(conn) != nil {
+				return
+			}
+			outcome = w.Idle()
+			continue
+		case pool.Expired:
+			reason = "expired"
+			goodbye(conn)
+			return
+		case pool.Leased:
+		default:
+			reason = "shutdown"
 			return
 		}
 		if last == math.MaxUint64 {
@@ -142,13 +187,15 @@ func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
 		r.log.Info("lease started", "event", "lease_started", "service", service, "connection_id", w.ID, "lease_id", id)
 		e := r.lease(conn, tcp, w, &codec, id)
 		_ = tcp.Close()
-		if e != nil {
+		if e != nil && !errors.Is(e, errClientClose) {
 			return
 		}
 		r.log.Info("lease finished", "event", "lease_finished", "service", service, "connection_id", w.ID, "lease_id", id)
-		if !r.ready(w, service) {
+		if e != nil {
+			reason = "client_close"
 			return
 		}
+		outcome = w.Idle()
 	}
 }
 func (r *runtime) lease(conn *protocol.Conn, tcp *net.TCPConn, w *pool.Worker, codec *relay.Relay, id uint64) error {
@@ -187,6 +234,9 @@ func (r *runtime) lease(conn *protocol.Conn, tcp *net.TCPConn, w *pool.Worker, c
 	f, e = conn.ReadFrame()
 	if e != nil {
 		return e
+	}
+	if f.Type == protocol.CLOSE && f.LeaseID == 0 {
+		return errClientClose
 	}
 	if f.Type != protocol.READY || f.LeaseID != id {
 		return errors.New("invalid release barrier")

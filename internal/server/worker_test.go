@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -33,8 +34,8 @@ func TestOpenErrorClosesPublicBeforeReleaseBarrier(t *testing.T) {
 	defer right.Close()
 	server := protocol.NewConn(left)
 	client := protocol.NewConn(right)
-	p := pool.New(1, 1)
-	w, _ := p.Register(1, func() {})
+	p := pool.New(1)
+	w, _ := p.Register(1, pool.Options{}, func() {})
 	defer w.Closed()
 	done := make(chan error, 1)
 	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1) }()
@@ -93,8 +94,8 @@ func TestDataAfterFINRejectsRelease(t *testing.T) {
 	defer right.Close()
 	server := protocol.NewConn(left)
 	client := protocol.NewConn(right)
-	p := pool.New(1, 1)
-	w, _ := p.Register(1, func() {})
+	p := pool.New(1)
+	w, _ := p.Register(1, pool.Options{}, func() {})
 	defer w.Closed()
 	var codec relay.Relay
 	defer codec.Close()
@@ -156,5 +157,73 @@ func TestDataAfterFINRejectsRelease(t *testing.T) {
 	case <-forged:
 	case <-time.After(time.Second):
 		t.Fatal("forged writer blocked")
+	}
+}
+
+func TestClientCloseAtBarrier(t *testing.T) {
+	ln, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer ln.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() { c, _ := ln.Accept(); accepted <- c.(*net.TCPConn) }()
+	visitor, e := net.Dial("tcp", ln.Addr().String())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer visitor.Close()
+	public := <-accepted
+	defer public.Close()
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	server := protocol.NewConn(left)
+	client := protocol.NewConn(right)
+	p := pool.New(1)
+	w, _ := p.Register(1, pool.Options{}, func() {})
+	defer w.Closed()
+	done := make(chan error, 1)
+	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1) }()
+	if f, e := client.ReadFrame(); e != nil || f.Type != protocol.OPEN {
+		t.Fatalf("OPEN: %v", e)
+	}
+	if e = client.WriteFrame(protocol.Frame{Type: protocol.OPEN_ERR, LeaseID: 1, Payload: protocol.JSON(protocol.Code{Code: "dial_failed"})}); e != nil {
+		t.Fatal(e)
+	}
+	if f, e := client.ReadFrame(); e != nil || f.Type != protocol.RELEASE {
+		t.Fatalf("RELEASE: %v", e)
+	}
+	if e = client.WriteFrame(protocol.Frame{Type: protocol.CLOSE}); e != nil {
+		t.Fatal(e)
+	}
+	select {
+	case e = <-done:
+		if !errors.Is(e, errClientClose) {
+			t.Fatalf("barrier CLOSE: %v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("barrier CLOSE blocked")
+	}
+}
+
+func TestPoolOptionsValidation(t *testing.T) {
+	good := protocol.PoolParams{HeartbeatMS: 15000, IdleTimeoutMS: 300000, IdleJitterMS: 30000, MaxLifetimeMS: 3600000, LifetimeJitterMS: 360000}
+	o, e := poolOptions(good)
+	if e != nil || o.Heartbeat != 15*time.Second || o.MaxLifetime != time.Hour {
+		t.Fatal("valid pool rejected", e)
+	}
+	for name, mutate := range map[string]func(*protocol.PoolParams){
+		"missing":        func(p *protocol.PoolParams) { *p = protocol.PoolParams{} },
+		"fast heartbeat": func(p *protocol.PoolParams) { p.HeartbeatMS = 10 },
+		"negative":       func(p *protocol.PoolParams) { p.IdleJitterMS = -1 },
+		"huge":           func(p *protocol.PoolParams) { p.MaxLifetimeMS = 1 << 62 },
+		"jitter":         func(p *protocol.PoolParams) { p.IdleJitterMS = p.IdleTimeoutMS + 1 },
+	} {
+		p := good
+		mutate(&p)
+		if _, e := poolOptions(p); e == nil {
+			t.Fatal(name, "accepted")
+		}
 	}
 }
