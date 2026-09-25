@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/protocol"
@@ -167,7 +168,11 @@ func (r *Relay) Run(ctx context.Context, tunnel *protocol.Conn, tcp *net.TCPConn
 			e = r.reader.finish()
 		}
 		if e == nil {
-			e = tcp.CloseWrite()
+			// ENOTCONN means the local peer already reset the socket.
+			// The incoming stream ended with FIN, so nothing is lost.
+			if e = tcp.CloseWrite(); errors.Is(e, syscall.ENOTCONN) {
+				e = nil
+			}
 		}
 		errorsCh <- e
 	}()

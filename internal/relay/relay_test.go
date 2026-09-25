@@ -75,3 +75,53 @@ func TestRelayInteractiveAndReuse(t *testing.T) {
 		_ = c.Close()
 	}
 }
+
+// A local peer that half-closes and then resets its socket leaves the relay
+// with a dead socket when the tunnel FIN arrives. Shutting down the write
+// side then fails with ENOTCONN, which must not fail the lease: the peer is
+// gone and the incoming stream ended cleanly.
+func TestRelayToleratesResetPeerAtCloseWrite(t *testing.T) {
+	var server, client Relay
+	defer server.Close()
+	defer client.Close()
+	visitor, front := tcpPair(t)
+	defer visitor.Close()
+	target, backend := tcpPair(t)
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	serverDone := make(chan error, 1)
+	clientDone := make(chan error, 1)
+	go func() { serverDone <- server.Run(context.Background(), protocol.NewConn(left), front, 1) }()
+	go func() { clientDone <- client.Run(context.Background(), protocol.NewConn(right), backend, 1) }()
+	// The backend closes first: its FIN crosses the tunnel and reaches the visitor.
+	_ = target.CloseWrite()
+	_ = visitor.SetDeadline(time.Now().Add(2 * time.Second))
+	if b, e := io.ReadAll(visitor); e != nil || len(b) != 0 {
+		t.Fatalf("backend FIN not relayed: %q %v", b, e)
+	}
+	// Then it resets the connection before the visitor has finished.
+	if e := target.SetLinger(0); e != nil {
+		t.Fatal(e)
+	}
+	_ = target.Close()
+	time.Sleep(100 * time.Millisecond)
+	_ = visitor.CloseWrite()
+	// Collect both results before failing so the deferred Close calls never
+	// race with a relay that is still running.
+	var results [2]error
+	for i, done := range []chan error{clientDone, serverDone} {
+		select {
+		case results[i] = <-done:
+		case <-time.After(2 * time.Second):
+			_ = left.Close()
+			_ = backend.Close()
+			_ = front.Close()
+			results[i] = <-done
+			t.Errorf("relay %d stuck", i)
+		}
+	}
+	if results[0] != nil || results[1] != nil {
+		t.Fatalf("relay failed after peer reset: client %v, server %v", results[0], results[1])
+	}
+}
