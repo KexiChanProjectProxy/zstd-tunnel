@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/config"
+	"github.com/kexichanprojectproxy/zstd-tunnel/internal/metrics"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/pool"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/transport"
 )
@@ -34,20 +35,36 @@ func Run(ctx context.Context, cfg *config.Server) error {
 		}
 		listeners[name] = ln
 	}
+	var metricsLn net.Listener
+	if cfg.Metrics != nil {
+		if metricsLn, e = net.Listen("tcp", cfg.Metrics.BindAddr); e != nil {
+			_ = tunnel.Close()
+			for _, open := range listeners {
+				_ = open.Close()
+			}
+			return e
+		}
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	r := &runtime{cfg: cfg, pools: make(map[string]*pool.Pool, len(listeners)), log: log}
+	names := make([]string, 0, len(listeners))
 	for name := range listeners {
 		r.pools[name] = pool.New(cfg.Pool.MaxPending)
+		names = append(names, name)
 	}
+	r.metrics = metrics.NewServer(names, r.pools)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var accepts sync.WaitGroup
-	errs := make(chan error, len(listeners)+1)
+	// One slot per goroutine that may report a failure: the service
+	// listeners, the tunnel listener and the metrics server.
+	errs := make(chan error, len(listeners)+2)
 	for name, ln := range listeners {
 		log.Info("service listening", "event", "server_listening", "service", name, "address", ln.Addr().String())
 		accepts.Add(1)
 		go func(name string, ln net.Listener) {
 			defer accepts.Done()
+			stats := r.metrics.Service(name)
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
@@ -58,7 +75,10 @@ func Run(ctx context.Context, cfg *config.Server) error {
 				}
 				tcp := conn.(*net.TCPConn)
 				_ = tcp.SetKeepAlive(true)
-				_ = r.pools[name].Dispatch(runCtx, tcp, time.Now().Add(cfg.Pool.AcquireTimeout))
+				stats.Visitors.Add(1)
+				if err := r.pools[name].Dispatch(runCtx, tcp, time.Now().Add(cfg.Pool.AcquireTimeout)); err != nil {
+					stats.DispatchFailed(err)
+				}
 			}
 		}(name, ln)
 	}
@@ -70,6 +90,21 @@ func Run(ctx context.Context, cfg *config.Server) error {
 			errs <- err
 		}
 	}()
+	// The metrics server outlives the drain below so scrapes can watch
+	// leases finish; it has its own context and stops just before Run returns.
+	metricsCtx, stopMetrics := context.WithCancel(context.Background())
+	defer stopMetrics()
+	var metricsDone sync.WaitGroup
+	if metricsLn != nil {
+		log.Info("metrics listening", "event", "metrics_listening", "address", metricsLn.Addr().String())
+		metricsDone.Add(1)
+		go func() {
+			defer metricsDone.Done()
+			if err := r.metrics.Serve(metricsCtx, metricsLn, cfg.Metrics, log); err != nil && metricsCtx.Err() == nil {
+				errs <- err
+			}
+		}()
+	}
 	var failure error
 	select {
 	case <-ctx.Done():
@@ -97,5 +132,7 @@ func Run(ctx context.Context, cfg *config.Server) error {
 		}
 		<-done
 	}
+	stopMetrics()
+	metricsDone.Wait()
 	return failure
 }

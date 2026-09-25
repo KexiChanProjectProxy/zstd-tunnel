@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/config"
+	"github.com/kexichanprojectproxy/zstd-tunnel/internal/metrics"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/pool"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/protocol"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/relay"
@@ -26,6 +27,7 @@ type runtime struct {
 	cfg     *config.Server
 	pools   map[string]*pool.Pool
 	log     *slog.Logger
+	metrics *metrics.Exporter
 	ids     atomic.Uint64
 	workers sync.WaitGroup
 }
@@ -84,11 +86,13 @@ func (r *runtime) register(in *transport.Incoming) {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	r.metrics.Service(hello.Service).Opened.Add(1)
 	r.workers.Add(1)
 	go func() { defer r.workers.Done(); r.work(conn, w, hello.Service) }()
 }
 func (r *runtime) reject(c *protocol.Conn, id uint64, code string) {
 	r.log.Warn("registration rejected", "event", "registration_rejected", "connection_id", id, "code", code)
+	r.metrics.Rejected(code)
 	_ = c.WriteFrame(protocol.Frame{Type: protocol.HELLO_ERR, Payload: protocol.JSON(protocol.Code{Code: code})})
 	_ = c.Close()
 }
@@ -140,12 +144,14 @@ func heartbeat(conn *protocol.Conn) error {
 }
 
 func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
+	stats := r.metrics.Service(service)
 	reason := "error"
 	defer func() {
 		w.Closed()
+		stats.Closed(reason)
 		r.log.Info("connection closed", "event", "connection_closed", "service", service, "connection_id", w.ID, "reason", reason)
 	}()
-	var codec relay.Relay
+	codec := relay.Relay{Counters: &stats.Relay}
 	defer codec.Close()
 	var last uint64
 	outcome := w.Idle()
@@ -193,7 +199,7 @@ func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
 		last++
 		id := last
 		r.log.Info("lease started", "event", "lease_started", "service", service, "connection_id", w.ID, "lease_id", id)
-		e := r.lease(conn, tcp, w, &codec, id)
+		e := r.lease(conn, tcp, w, &codec, id, stats)
 		_ = tcp.Close()
 		if e != nil && !errors.Is(e, errClientClose) {
 			return
@@ -206,7 +212,24 @@ func (r *runtime) work(conn *protocol.Conn, w *pool.Worker, service string) {
 		outcome = w.Idle()
 	}
 }
-func (r *runtime) lease(conn *protocol.Conn, tcp *net.TCPConn, w *pool.Worker, codec *relay.Relay, id uint64) error {
+
+// lease serves one visitor from OPEN to the release barrier and records the
+// outcome and duration on stats.
+func (r *runtime) lease(conn *protocol.Conn, tcp *net.TCPConn, w *pool.Worker, codec *relay.Relay, id uint64, stats *metrics.Service) (err error) {
+	start := time.Now()
+	dialFailed := false
+	defer func() {
+		outcome := metrics.LeaseOK
+		switch {
+		case errors.Is(err, errClientClose):
+			outcome = metrics.LeaseClientClose
+		case err != nil:
+			outcome = metrics.LeaseError
+		case dialFailed:
+			outcome = metrics.LeaseDialFailed
+		}
+		stats.LeaseDone(outcome, time.Since(start))
+	}()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if e := conn.WriteFrame(protocol.Frame{Type: protocol.OPEN, LeaseID: id}); e != nil {
 		return e
@@ -229,6 +252,7 @@ func (r *runtime) lease(conn *protocol.Conn, tcp *net.TCPConn, w *pool.Worker, c
 		if e = protocol.DecodeJSON(f.Payload, &code); e != nil || code.Code != "dial_failed" {
 			return errors.New("invalid OPEN_ERR")
 		}
+		dialFailed = true
 		_ = tcp.Close()
 		_ = conn.SetDeadline(time.Time{})
 	default:

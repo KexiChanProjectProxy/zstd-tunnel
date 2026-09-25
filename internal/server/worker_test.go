@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kexichanprojectproxy/zstd-tunnel/internal/metrics"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/pool"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/protocol"
 	"github.com/kexichanprojectproxy/zstd-tunnel/internal/relay"
@@ -41,7 +42,7 @@ func TestOpenErrorClosesPublicBeforeReleaseBarrier(t *testing.T) {
 	w, _ := p.Register(1, pool.Options{}, func() {})
 	defer w.Closed()
 	done := make(chan error, 1)
-	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1) }()
+	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1, &metrics.Service{}) }()
 	f, e := client.ReadFrame()
 	if e != nil || f.Type != protocol.OPEN {
 		t.Fatalf("OPEN: %v", e)
@@ -103,7 +104,7 @@ func TestDataAfterFINRejectsRelease(t *testing.T) {
 	var codec relay.Relay
 	defer codec.Close()
 	done := make(chan error, 1)
-	go func() { done <- (&runtime{}).lease(server, public, w, &codec, 1) }()
+	go func() { done <- (&runtime{}).lease(server, public, w, &codec, 1, &metrics.Service{}) }()
 	f, e := client.ReadFrame()
 	if e != nil || f.Type != protocol.OPEN {
 		t.Fatal("missing OPEN", e)
@@ -187,7 +188,7 @@ func TestClientCloseAtBarrier(t *testing.T) {
 	w, _ := p.Register(1, pool.Options{}, func() {})
 	defer w.Closed()
 	done := make(chan error, 1)
-	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1) }()
+	go func() { done <- (&runtime{}).lease(server, public, w, &relay.Relay{}, 1, &metrics.Service{}) }()
 	if f, e := client.ReadFrame(); e != nil || f.Type != protocol.OPEN {
 		t.Fatalf("OPEN: %v", e)
 	}
