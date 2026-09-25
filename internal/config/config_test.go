@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 func TestConfiguration(t *testing.T) {
 	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	token := strings.Repeat("x", 32)
+	metricsPass := "metrics-secret-" + strings.Repeat("z", 16)
+	metrics := "[client.metrics]\nbind_addr='127.0.0.1:9100'\nusername='prom'\npassword='" + metricsPass + "'\n"
 	base := "[client]\nremote_addr='localhost:2333'\ndefault_token='" + token + "'\n[client.transport]\ntype='noise'\n[client.transport.noise]\nlocal_private_key='" + key + "'\nremote_public_key='" + key + "'\n[client.services.ssh]\nlocal_addr='localhost:22'\n"
 	load := func(s string) (*Config, error) {
 		t.Helper()
@@ -29,33 +32,43 @@ func TestConfiguration(t *testing.T) {
 		t.Fatal("defaults or token inheritance", pl)
 	}
 	for name, s := range map[string]string{
-		"unknown":                 base + "[client.pool]\nunknown=1\n",
-		"both":                    base + "[server]\nbind_addr='localhost:2334'\n",
-		"no service":              strings.Split(base, "[client.services.ssh]")[0],
-		"short token":             strings.Replace(base, token, "tiny", 1),
-		"empty token":             base + "token=''\n",
-		"bad key":                 strings.Replace(base, key, "not-base64", 1),
-		"noise with tls":          base + "[client.transport.tls]\nca_file='ca.pem'\n",
-		"zero pool":               base + "[client.pool]\nmin_idle=0\n",
-		"old size field":          base + "[client.pool]\nsize=4\n",
-		"min above max":           base + "[client.pool]\nmin_idle=3\nmax_idle=2\n",
-		"zero heartbeat":          base + "[client.pool]\nheartbeat='0s'\n",
-		"bad duration":            base + "[client.pool]\nidle_timeout='soon'\n",
-		"idle jitter too large":   base + "[client.pool]\nidle_timeout='10s'\nidle_jitter='11s'\n",
-		"negative jitter":         base + "[client.pool]\nlifetime_jitter='-1s'\n",
-		"server max_connections":  "[server]\nbind_addr='localhost:2334'\ndefault_token='" + token + "'\n[server.transport]\ntype='noise'\n[server.transport.noise]\nlocal_private_key='" + key + "'\nremote_public_key='" + key + "'\n[server.pool]\nmax_connections=4\n[server.services.ssh]\nbind_addr=':2222'\n",
-		"long timeout":            strings.Replace(base, "remote_addr=", "dial_timeout='6s'\nremote_addr=", 1),
-		"bad port":                strings.Replace(base, "localhost:2333", "localhost:0", 1),
-		"signed port":             strings.Replace(base, "localhost:2333", "localhost:+2333", 1),
-		"wrong role empty field":  base + "bind_addr=''\n",
-		"invalid explicit tls CA": strings.Replace(strings.Replace(base, "[client.transport.noise]\nlocal_private_key='"+key+"'\nremote_public_key='"+key+"'\n", "", 1), "type='noise'", "type='wss'", 1) + "[client.transport.tls]\nca_file=''\n",
+		"unknown":                    base + "[client.pool]\nunknown=1\n",
+		"both":                       base + "[server]\nbind_addr='localhost:2334'\n",
+		"no service":                 strings.Split(base, "[client.services.ssh]")[0],
+		"short token":                strings.Replace(base, token, "tiny", 1),
+		"empty token":                base + "token=''\n",
+		"bad key":                    strings.Replace(base, key, "not-base64", 1),
+		"noise with tls":             base + "[client.transport.tls]\nca_file='ca.pem'\n",
+		"zero pool":                  base + "[client.pool]\nmin_idle=0\n",
+		"old size field":             base + "[client.pool]\nsize=4\n",
+		"min above max":              base + "[client.pool]\nmin_idle=3\nmax_idle=2\n",
+		"zero heartbeat":             base + "[client.pool]\nheartbeat='0s'\n",
+		"bad duration":               base + "[client.pool]\nidle_timeout='soon'\n",
+		"idle jitter too large":      base + "[client.pool]\nidle_timeout='10s'\nidle_jitter='11s'\n",
+		"negative jitter":            base + "[client.pool]\nlifetime_jitter='-1s'\n",
+		"server max_connections":     "[server]\nbind_addr='localhost:2334'\ndefault_token='" + token + "'\n[server.transport]\ntype='noise'\n[server.transport.noise]\nlocal_private_key='" + key + "'\nremote_public_key='" + key + "'\n[server.pool]\nmax_connections=4\n[server.services.ssh]\nbind_addr=':2222'\n",
+		"long timeout":               strings.Replace(base, "remote_addr=", "dial_timeout='6s'\nremote_addr=", 1),
+		"bad port":                   strings.Replace(base, "localhost:2333", "localhost:0", 1),
+		"signed port":                strings.Replace(base, "localhost:2333", "localhost:+2333", 1),
+		"wrong role empty field":     base + "bind_addr=''\n",
+		"invalid explicit tls CA":    strings.Replace(strings.Replace(base, "[client.transport.noise]\nlocal_private_key='"+key+"'\nremote_public_key='"+key+"'\n", "", 1), "type='noise'", "type='wss'", 1) + "[client.transport.tls]\nca_file=''\n",
+		"metrics missing bind_addr":  base + strings.Replace(metrics, "bind_addr='127.0.0.1:9100'\n", "", 1),
+		"metrics missing username":   base + strings.Replace(metrics, "username='prom'\n", "", 1),
+		"metrics missing password":   base + strings.Replace(metrics, "password='"+metricsPass+"'\n", "", 1),
+		"metrics empty username":     base + strings.Replace(metrics, "'prom'", "''", 1),
+		"metrics colon username":     base + strings.Replace(metrics, "'prom'", "'pr:om'", 1),
+		"metrics short password":     base + strings.Replace(metrics, metricsPass, "short-"+metricsPass[:9], 1),
+		"metrics bad port":           base + strings.Replace(metrics, "127.0.0.1:9100", "127.0.0.1:0", 1),
+		"metrics bad address":        base + strings.Replace(metrics, "127.0.0.1:9100", "127.0.0.1", 1),
+		"metrics unknown field":      base + metrics + "tls=true\n",
+		"server metrics no password": "[server]\nbind_addr='localhost:2334'\ndefault_token='" + token + "'\n[server.transport]\ntype='noise'\n[server.transport.noise]\nlocal_private_key='" + key + "'\nremote_public_key='" + key + "'\n[server.services.ssh]\nbind_addr=':2222'\n[server.metrics]\nbind_addr=':9100'\nusername='prom'\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, e := load(s)
 			if e == nil {
 				t.Fatal("accepted invalid configuration")
 			}
-			if strings.Contains(e.Error(), token) || strings.Contains(e.Error(), key) {
+			if strings.Contains(e.Error(), token) || strings.Contains(e.Error(), key) || strings.Contains(e.Error(), "metrics-secret") {
 				t.Fatal("secret in error", e)
 			}
 		})
@@ -83,5 +96,19 @@ func TestConfiguration(t *testing.T) {
 	}
 	if cfg.Client.Services["ssh"].Token != strings.Repeat("y", 32) {
 		t.Fatal("service token override")
+	}
+	if cfg.Client.Metrics != nil {
+		t.Fatal("metrics enabled without a [client.metrics] table")
+	}
+	cfg, e = load(base + metrics)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m := cfg.Client.Metrics; m == nil || m.BindAddr != "127.0.0.1:9100" || m.UsernameHash != sha256.Sum256([]byte("prom")) || m.PasswordHash != sha256.Sum256([]byte(metricsPass)) {
+		t.Fatal("client metrics", cfg.Client.Metrics)
+	}
+	cfg, e = load("[server]\nbind_addr='localhost:2334'\ndefault_token='" + token + "'\n[server.transport]\ntype='noise'\n[server.transport.noise]\nlocal_private_key='" + key + "'\nremote_public_key='" + key + "'\n[server.services.ssh]\nbind_addr=':2222'\n" + strings.ReplaceAll(metrics, "client.", "server."))
+	if e != nil || cfg.Server.Metrics == nil || cfg.Server.Metrics.BindAddr != "127.0.0.1:9100" {
+		t.Fatal("server metrics", e)
 	}
 }

@@ -34,6 +34,7 @@ type Server struct {
 	Services  map[string]Service
 	Transport ServerTransport
 	Pool      ServerPool
+	Metrics   *Metrics
 }
 type Client struct {
 	RemoteAddr  string
@@ -41,6 +42,14 @@ type Client struct {
 	Services    map[string]Service
 	Transport   ClientTransport
 	Pool        ClientPool
+	Metrics     *Metrics
+}
+
+// Metrics configures the Prometheus endpoint. A nil *Metrics disables it.
+// Only credential hashes are kept; the endpoint compares hashes.
+type Metrics struct {
+	BindAddr                   string
+	UsernameHash, PasswordHash [32]byte
 }
 type ServerPool struct {
 	MaxPending     int
@@ -79,6 +88,7 @@ type rawServer struct {
 	Services     map[string]rawService `toml:"services"`
 	Transport    rawTransport          `toml:"transport"`
 	Pool         rawServerPool         `toml:"pool"`
+	Metrics      *rawMetrics           `toml:"metrics"`
 }
 type rawClient struct {
 	RemoteAddr   string                `toml:"remote_addr"`
@@ -87,6 +97,12 @@ type rawClient struct {
 	Services     map[string]rawService `toml:"services"`
 	Transport    rawTransport          `toml:"transport"`
 	Pool         rawClientPool         `toml:"pool"`
+	Metrics      *rawMetrics           `toml:"metrics"`
+}
+type rawMetrics struct {
+	BindAddr *string `toml:"bind_addr"`
+	Username *string `toml:"username"`
+	Password *string `toml:"password"`
 }
 type rawTransport struct {
 	Type      string    `toml:"type"`
@@ -181,7 +197,11 @@ func Load(path string) (cfg *Config, err error) {
 		if p.MaxPending < 1 || p.MaxPending > 4096 || p.AcquireTimeout <= 0 || p.AcquireTimeout > time.Minute {
 			return nil, errors.New("server.pool: invalid limits")
 		}
-		return &Config{Server: &Server{BindAddr: r.BindAddr, Services: services, Transport: tr, Pool: p}}, nil
+		m, err := metricsConfig(r.Metrics, "server.metrics")
+		if err != nil {
+			return nil, err
+		}
+		return &Config{Server: &Server{BindAddr: r.BindAddr, Services: services, Transport: tr, Pool: p, Metrics: m}}, nil
 	}
 	r := raw.Client
 	if err = address(r.RemoteAddr, true); err != nil {
@@ -209,9 +229,41 @@ func Load(path string) (cfg *Config, err error) {
 	if err != nil {
 		return nil, err
 	}
+	m, err := metricsConfig(r.Metrics, "client.metrics")
+	if err != nil {
+		return nil, err
+	}
 	tr.RemoteAddr = r.RemoteAddr
 	tr.DialTimeout = timeout
-	return &Config{Client: &Client{RemoteAddr: r.RemoteAddr, DialTimeout: timeout, Services: services, Transport: tr, Pool: pool}}, nil
+	return &Config{Client: &Client{RemoteAddr: r.RemoteAddr, DialTimeout: timeout, Services: services, Transport: tr, Pool: pool, Metrics: m}}, nil
+}
+
+// metricsConfig validates a [server.metrics] or [client.metrics] table.
+// Basic auth is mandatory when the endpoint is enabled. Error messages never
+// include the configured values.
+func metricsConfig(r *rawMetrics, prefix string) (*Metrics, error) {
+	if r == nil {
+		return nil, nil
+	}
+	if r.BindAddr == nil {
+		return nil, fmt.Errorf("%s.bind_addr: required", prefix)
+	}
+	if err := address(*r.BindAddr, false); err != nil {
+		return nil, fmt.Errorf("%s.bind_addr: %w", prefix, err)
+	}
+	if r.Username == nil {
+		return nil, fmt.Errorf("%s.username: required", prefix)
+	}
+	if len(*r.Username) < 1 || len(*r.Username) > 64 || strings.ContainsAny(*r.Username, ":\x00\r\n") {
+		return nil, fmt.Errorf("%s.username: must be 1..64 bytes without ':' or control characters", prefix)
+	}
+	if r.Password == nil {
+		return nil, fmt.Errorf("%s.password: required", prefix)
+	}
+	if len(*r.Password) < 16 || len(*r.Password) > 256 {
+		return nil, fmt.Errorf("%s.password: length must be 16..256 bytes", prefix)
+	}
+	return &Metrics{BindAddr: *r.BindAddr, UsernameHash: sha256.Sum256([]byte(*r.Username)), PasswordHash: sha256.Sum256([]byte(*r.Password))}, nil
 }
 
 func clientPool(r rawClientPool) (ClientPool, error) {
